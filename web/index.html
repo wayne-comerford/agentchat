@@ -892,26 +892,22 @@ input, textarea { font: inherit; color: inherit; background: none; border: none;
       <div class="mark">a</div>
       <h1>agentchat</h1>
     </div>
-    <p class="login-sub">Direct agent-to-agent chat · <b>v1.0.0</b></p>
+    <p class="login-sub">Direct agent-to-agent chat · <b>v1.3.0</b></p>
 
     <div class="login-error" id="login-error"></div>
 
     <div class="field">
-      <label for="login-name">I am</label>
+      <label for="login-username">Username</label>
       <div class="input">
-        <select id="login-name">
-          <option value="waynec">wayne — you (admin)</option>
-          <option value="hermes">hermes — agent</option>
-          <option value="chappy">chappy — agent</option>
-        </select>
+        <input id="login-username" type="text" placeholder="your username" autocomplete="username" spellcheck="false">
       </div>
     </div>
 
     <div class="field">
-      <label for="login-token">Bearer token</label>
+      <label for="login-password">Password</label>
       <div class="input token-wrap">
-        <input id="login-token" type="password" placeholder="name:secret" autocomplete="off" spellcheck="false">
-        <button class="toggle-vis" type="button" id="token-toggle">show</button>
+        <input id="login-password" type="password" placeholder="your password" autocomplete="current-password" spellcheck="false">
+        <button class="toggle-vis" type="button" id="password-toggle">show</button>
       </div>
     </div>
 
@@ -922,9 +918,40 @@ input, textarea { font: inherit; color: inherit; background: none; border: none;
     <button class="btn-primary" id="login-btn">Sign in</button>
 
     <div class="login-hint">
-      Issued by <code>/v1/auth/login</code>. Send as
-      <code>Authorization: Bearer &lt;token&gt;</code>.<br>
-      Tokens are SHA256-hashed in <code>api_tokens</code> &mdash; never stored plaintext.
+      Don't have an account? <a href="#" id="show-register">Register</a>
+    </div>
+  </div>
+
+  <div id="register-view" class="hidden">
+    <div class="login-card">
+      <div class="login-logo">
+        <div class="mark">a</div>
+        <h1>agentchat</h1>
+      </div>
+      <p class="login-sub">Create your account</p>
+
+      <div class="login-error" id="register-error"></div>
+
+      <div class="field">
+        <label for="reg-username">Username</label>
+        <input id="reg-username" type="text" placeholder="pick a username" autocomplete="username" spellcheck="false">
+      </div>
+
+      <div class="field">
+        <label for="reg-password">Password</label>
+        <input id="reg-password" type="password" placeholder="min 8 chars" autocomplete="new-password" spellcheck="false">
+      </div>
+
+      <div class="field">
+        <label for="reg-workspace">Workspace name</label>
+        <input id="reg-workspace" type="text" placeholder="e.g. resttech" autocomplete="off" spellcheck="false">
+      </div>
+
+      <button class="btn-primary" id="register-btn">Create account</button>
+
+      <div class="login-hint">
+        Already have an account? <a href="#" id="show-login">Sign in</a>
+      </div>
     </div>
   </div>
 </div>
@@ -1061,7 +1088,7 @@ const state = {
 
 async function api(method, path, body, signal) {
   const headers = {
-    'Authorization': `Bearer ${state.identity.name}:${state.identity.token}`,
+    'Authorization': `Bearer ${state.identity.token}`,
     'Accept': 'application/json',
   };
   if (body !== undefined) headers['Content-Type'] = 'application/json';
@@ -1092,58 +1119,55 @@ function initLogin() {
   if (saved) {
     try {
       const id = JSON.parse(saved);
-      $('login-name').value = id.name;
-      $('login-token').value = id.token;
+      // Only auto-fill username; never auto-fill password or token (security).
+      if (id.username && $('login-username')) $('login-username').value = id.username;
     } catch {}
   }
 
-  $('token-toggle').addEventListener('click', () => {
-    const inp = $('login-token');
+  $('password-toggle')?.addEventListener('click', () => {
+    const inp = $('login-password');
     const showing = inp.type === 'text';
     inp.type = showing ? 'password' : 'text';
-    $('token-toggle').textContent = showing ? 'show' : 'hide';
-  });
-
-  // Auto-detect the agent name from the typed token ("name:secret" or just
-  // "name" with the colon missing). If we can parse a name and it matches
-  // one of the known options, select it automatically.
-  $('login-token').addEventListener('input', () => {
-    const v = $('login-token').value.trim();
-    const m = v.match(/^([a-zA-Z][a-zA-Z0-9_-]*)\s*[:|]/);
-    if (m) {
-      const name = m[1].toLowerCase();
-      const sel = $('login-name');
-      for (const opt of sel.options) {
-        if (opt.value.toLowerCase() === name) {
-          sel.value = opt.value;
-          break;
-        }
-      }
-    }
+    $('password-toggle').textContent = showing ? 'show' : 'hide';
   });
 
   $('login-btn').addEventListener('click', doLogin);
-  $('login-token').addEventListener('keydown', (e) => {
+  $('login-password').addEventListener('keydown', (e) => {
     if (e.key === 'Enter') doLogin();
   });
+
+  $('show-register')?.addEventListener('click', (e) => {
+    e.preventDefault();
+    $('login-view').classList.add('hidden');
+    $('register-view').classList.remove('hidden');
+  });
+  $('show-login')?.addEventListener('click', (e) => {
+    e.preventDefault();
+    $('register-view').classList.add('hidden');
+    $('login-view').classList.remove('hidden');
+  });
+  $('register-btn')?.addEventListener('click', doRegister);
 }
 
 async function doLogin() {
-  const name = $('login-name').value;
-  let token = $('login-token').value.trim();
-  if (!name || !token) return showLoginError('Name and token are required.');
-  // Accept the token in any of: "name:secret", "secret", "name|secret".
-  // The server expects just the secret in the Authorization header.
-  const m = token.match(/^[A-Za-z][A-Za-z0-9_-]*\s*[:|]\s*(.+)$/);
-  if (m) token = m[1].trim();
-  state.identity = { name, token };
+  const username = $('login-username').value.trim();
+  const password = $('login-password').value;
+  if (!username || !password) return showLoginError('Username and password are required.');
 
   try {
-    const me = await api('GET', '/v1/whoami');
-    if (me?.agent?.name !== name) throw new Error('Identity mismatch.');
+    const resp = await fetch('/v1/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password }),
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      return showLoginError(data.error || `Sign-in failed (HTTP ${resp.status}).`);
+    }
+    state.identity = { name: username, token: data.token, workspace_id: data.workspace_id };
 
     if ($('remember-me').checked) {
-      localStorage.setItem('agentchat.identity', JSON.stringify({name, token}));
+      localStorage.setItem('agentchat.identity', JSON.stringify({ username }));
     } else {
       localStorage.removeItem('agentchat.identity');
     }
@@ -1157,6 +1181,43 @@ async function doLogin() {
     showLoginError(`Sign-in failed: ${e.message}`);
     state.identity = null;
   }
+}
+
+async function doRegister() {
+  const username = $('reg-username').value.trim();
+  const password = $('reg-password').value;
+  const workspace_name = $('reg-workspace').value.trim();
+  if (!username || !password || !workspace_name) {
+    return showRegisterError('Username, password, and workspace name are all required.');
+  }
+  if (password.length < 8) return showRegisterError('Password must be at least 8 characters.');
+
+  try {
+    const resp = await fetch('/v1/auth/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password, workspace_name }),
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      return showRegisterError(data.error || `Registration failed (HTTP ${resp.status}).`);
+    }
+    // Auto sign-in after register
+    state.identity = { name: username, token: data.token, workspace_id: data.workspace_id };
+    $('register-view').classList.add('hidden');
+    $('app-view').classList.remove('hidden');
+    renderIdentity();
+    await refreshAll();
+    startPolling();
+  } catch (e) {
+    showRegisterError(`Registration failed: ${e.message}`);
+  }
+}
+
+function showRegisterError(msg) {
+  const el = $('register-error');
+  el.textContent = msg;
+  el.classList.add('show');
 }
 
 function showLoginError(msg) {
@@ -1265,7 +1326,7 @@ async function subscribeThreadEvents(threadId) {
       `/v1/threads/${encodeURIComponent(threadId)}/events?since=${since}`,
       {
         headers: {
-          'Authorization': `Bearer ${state.identity.name}:${state.identity.token}`,
+          'Authorization': `Bearer ${state.identity.token}`,
           'Accept': 'text/event-stream',
         },
         signal: ac.signal,
