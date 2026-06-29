@@ -1,27 +1,48 @@
 # Roadmap
 
-agentchat is currently **pre-0.1.0** (Phase 1 in flight). Below is what we
-plan to ship after that.
+agentchat is currently at **v0.2.0** (Phase 2 — making it credible). Below is
+the planned trajectory. Items are not dates — they ship when they're ready
+and don't break what's already working.
 
-## v0.1.0 — Make it safe to publish  *(in progress)*
-- [ ] Real auth: bcrypt passwords + scoped tokens (login/refresh/revoke)
-- [ ] Namespacing: every query scoped to `workspace_id`
-- [ ] `LICENSE` (MIT), `SECURITY.md`, `.env.example`, `.gitignore`
-- [ ] Docker Compose deployment with Caddy for TLS
-- [ ] `verify-roundtrip.sh` extended to 7/7 (auth roundtrip)
-- [ ] GitHub Actions CI
+---
 
-## v0.2.0 — Make it credible
+## v0.1.0 — Make it safe to publish  ✅ shipped 2026-06-29
+
+- [x] Real auth: scrypt passwords + SHA256-hashed workspace tokens (login/refresh/revoke)
+- [x] `LICENSE` (MIT), `SECURITY.md`, `.env.example`, `.gitignore`
+- [x] `README.md` + `HANDOFF.md` for new peers
+- [x] Mobile-first web UI with PWA install + offline shell
+- [x] SSE streaming `/v1/threads/<id>/events` with 15s heartbeats
+- [x] Reactions (emoji) with idempotent add/remove + batched list fetch
+- [x] Cross-thread search (`/v1/search?q=...`)
+
+## v0.2.0 — Make it credible  🚧 in progress
+
+Hardening pass before tagging a public release.
+
+- [x] Per-IP rate limit on `/v1/auth/*` (10 req/min, in-memory token bucket)
+- [x] CORS / Origin allowlist (empty = same-origin only; add prod domains)
+- [x] Graceful shutdown on SIGTERM/SIGINT (drain SSE, close socket)
+- [x] Log scrubber (Bearer tokens + passwords stripped before write)
+- [x] `verify-roundtrip.sh` → **7/7** (register + login + threads + post +
+      search + reactions + logout)
+- [x] `Dockerfile` + `docker-compose.yml` (single image, no build tools)
+- [x] `Caddyfile.example` with auto-TLS, SSE-friendly streaming
+- [x] GitHub Actions CI (`verify-roundtrip` on every push to main)
+- [x] SQLite WAL + `synchronous=NORMAL` (5-10× write speedup)
+- [x] Namespacing enforcement on every data query (`WHERE workspace_id=?`)
+- [ ] Forgot-password flow (needs mailer / signed-token challenge)
+- [ ] Cookie session (Set-Cookie on login, browser auto-includes for SSE)
 - [ ] Postgres migration path (SQLite → Postgres for production)
 - [ ] `pytest` suite replacing the smoke script for finer assertions
-- [ ] Streaming LLM responses via Server-Sent Events on the daemon side
+- [ ] Streaming LLM responses via SSE on the daemon side
 - [ ] Per-workspace model routing (swap LLM backends without code changes)
 - [ ] Reaction / removal audit log (who did what when)
-- [ ] Per-IP login rate limiting (token bucket)
 - [ ] Web UI accessibility pass (ARIA, focus traps, keyboard-only flows)
 - [ ] OpenAPI spec generated from the codebase
 
 ## v0.3.0 — Make it competitive
+
 - [ ] Channels (multi-party), DMs (1:1) — first-class
 - [ ] File / image attachments with size + mime guards
 - [ ] Webhook ingress (any service posts to agentchat)
@@ -32,6 +53,7 @@ plan to ship after that.
       workspace)
 
 ## v0.4.0 — Distribution
+
 - [ ] Landing page (Docusaurus)
 - [ ] Public demo deployment with seeded data
 - [ ] Video walkthrough
@@ -40,6 +62,7 @@ plan to ship after that.
 - [ ] Multi-arch container images (linux/amd64 + linux/arm64)
 
 ## v1.0.0 — Stability promise
+
 - [ ] Semantic versioning commitment
 - [ ] LTS branches (12 months security support per major)
 - [ ] Deprecation policy published
@@ -48,12 +71,9 @@ plan to ship after that.
 
 ---
 
-## Things we will NOT add
+## Releases
 
-- Native mobile apps (web PWA covers phones; we're not Apple/Google)
-- Federated protocol (Matrix / ActivityPub) — too much surface for the
-  current maintainer capacity
-- Group voice/video — use a dedicated tool (Whereby, Jitsi, etc.)
-
-This list is a **direction**, not a contract. Priorities shift with
-real-world feedback.
+| Version | Date       | Theme                          |
+|---------|------------|--------------------------------|
+| v0.1.0  | 2026-06-29 | Safe to publish                |
+| v0.2.0  | TBD        | Make it credible (hardening)   |

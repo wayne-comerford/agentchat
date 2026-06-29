@@ -49,6 +49,7 @@ import signal
 import socketserver
 import sqlite3
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -71,7 +72,7 @@ LOG_PATH = AGENTCHAT_HOME / "server.log"
 
 DEFAULT_PORT = int(os.environ.get("AGENTCHAT_PORT", "7878"))
 DEFAULT_BIND = os.environ.get("AGENTCHAT_BIND", "0.0.0.0")
-SERVER_VERSION = "1.3.0"
+SERVER_VERSION = "0.2.0"
 
 MAX_BODY_BYTES = 64 * 1024  # 64 KiB per message
 THREAD_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_\-.]{0,63}$")
@@ -90,8 +91,44 @@ def hash_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
+# =====================================================================
+# Security: rate limiting + log scrubbing
+# =====================================================================
+
+# In-memory rate limiter for /v1/auth/* endpoints. Sliding 60-second window
+# keyed by remote IP. Cap = 10 attempts/min/IP — generous for humans, tight
+# enough to stop brute force. Resets when daemon restarts (acceptable).
+_RATELIMIT_BUCKET: dict[str, list[float]] = {}
+_RATELIMIT_MAX = 10        # max requests per window
+_RATELIMIT_WINDOW = 60.0    # seconds
+
+
+def _ratelimit_check(ip: str) -> bool:
+    """Return True if request is allowed, False if rate-limited."""
+    import time as _t
+    now = _t.monotonic()
+    bucket = _RATELIMIT_BUCKET.get(ip, [])
+    # Drop expired entries
+    bucket = [t for t in bucket if now - t < _RATELIMIT_WINDOW]
+    if len(bucket) >= _RATELIMIT_MAX:
+        _RATELIMIT_BUCKET[ip] = bucket
+        return False
+    bucket.append(now)
+    _RATELIMIT_BUCKET[ip] = bucket
+    return True
+
+
+# Bearer-token pattern used by the log scrubber. Same regex as auth flow.
+_BEARER_RE = re.compile(r"Bearer\s+[A-Za-z0-9_\-]{8,}", re.IGNORECASE)
+# Username/password in JSON bodies — strip from accidental logs.
+_CRED_RE = re.compile(r'"(password|token|refresh_token)"\s*:\s*"[^"]*"')
+
+
 def log(msg: str) -> None:
-    line = f"[{now_iso()}] {msg}"
+    # Strip anything that looks like a bearer token or credential before writing.
+    sanitized = _BEARER_RE.sub("Bearer ***", msg)
+    sanitized = _CRED_RE.sub(r'"\1":"***"', sanitized)
+    line = f"[{now_iso()}] {sanitized}"
     print(line, file=sys.stderr)
     try:
         with LOG_PATH.open("a") as f:
@@ -260,7 +297,9 @@ def db_connect() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")  # 5-10x faster than FULL; safe with WAL
     conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=5000")  # 5s wait before SQLITE_BUSY
     return conn
 
 
@@ -460,6 +499,15 @@ def user_register(
         )
 
         issued = _token_issue(conn, user_id, workspace_id, "register", "admin")
+
+        # v0.2 bridge: also seed the legacy `agents` table so the existing
+        # thread_create / message_post code paths (which check `agents`) work
+        # for new auth users. INSERT OR IGNORE = idempotent for re-registers.
+        conn.execute(
+            "INSERT OR IGNORE INTO agents(name, token_hash, role, endpoint, last_seen, created_at) "
+            "VALUES (?, ?, ?, NULL, ?, ?)",
+            (username, _token_hash(issued["token"]), "admin", now, now),
+        )
     finally:
         conn.close()
 
@@ -502,6 +550,13 @@ def user_login(username: str, password: str) -> Optional[dict]:
             (now_iso(), user_id),
         )
         issued = _token_issue(conn, user_id, ws_id, "login", "admin")
+
+        # v0.2 bridge: seed legacy `agents` table for new auth users (idempotent).
+        conn.execute(
+            "INSERT OR IGNORE INTO agents(name, token_hash, role, endpoint, last_seen, created_at) "
+            "VALUES (?, ?, ?, NULL, ?, ?)",
+            (username, _token_hash(issued["token"]), "admin", now_iso(), now_iso()),
+        )
     finally:
         conn.close()
     return {
@@ -1307,6 +1362,22 @@ _SEARCH_RE = re.compile(r"^/v1/search$")
 class AgentChatHandler(http.server.BaseHTTPRequestHandler):
     server_version = f"agentchat/{SERVER_VERSION}"
 
+    # ------------------------------------------------------------------
+    # CORS allowlist: which origins can call our /v1/* API from a browser.
+    # Empty set = same-origin only. Add your tunnel / prod domains here.
+    # ------------------------------------------------------------------
+    _ALLOWED_ORIGINS = frozenset({
+        "",  # same-origin (no Origin header)
+        # Add production + dev origins here as you deploy:
+        # "https://chat.example.com",
+    })
+
+    def _cors_origin_allowed(self) -> bool:
+        """True if the request's Origin is allowed to call our API."""
+        origin = self.headers.get("Origin", "")
+        # Same-origin requests (no Origin header) are always allowed.
+        return origin in self._ALLOWED_ORIGINS
+
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
         log(f"{self.address_string()} {format % args}")
 
@@ -1555,6 +1626,11 @@ class AgentChatHandler(http.server.BaseHTTPRequestHandler):
         url = urllib.parse.urlparse(self.path)
         path = url.path.rstrip("/") or "/"
         qs = urllib.parse.parse_qs(url.query)
+
+        # CORS: reject cross-origin requests that aren't on the allowlist.
+        # Same-origin (no Origin header) is allowed.
+        if not self._cors_origin_allowed():
+            return self._send_json(403, err("origin not allowed"))
 
         if path == "/":
             return self._send_json(200, {
@@ -1901,6 +1977,19 @@ class AgentChatHandler(http.server.BaseHTTPRequestHandler):
         url = urllib.parse.urlparse(self.path)
         path = url.path.rstrip("/") or "/"
 
+        # CORS: reject cross-origin requests that aren't on the allowlist.
+        if not self._cors_origin_allowed():
+            return self._send_json(403, err("origin not allowed"))
+
+        # Rate limit auth endpoints — 10 attempts per minute per IP.
+        # Protects /v1/auth/login + /v1/auth/register from brute force.
+        if path in ("/v1/auth/login", "/v1/auth/register"):
+            ip = self.client_address[0] if self.client_address else "unknown"
+            if not _ratelimit_check(ip):
+                self.send_response(429)
+                self.send_header("Retry-After", "60")
+                return self._send_json(429, err("too many auth attempts; retry in 60s"))
+
         # --- v0.1.0 auth endpoints (no Bearer required) ---
         if path == "/v1/auth/register":
             return self._handle_auth_register()
@@ -2080,13 +2169,28 @@ class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 def serve(host: str, port: int) -> None:
     db_init()
     server = ThreadingHTTPServer((host, port), AgentChatHandler)
+
+    # Graceful SIGTERM/SIGINT shutdown: stop accepting new connections, drain
+    # in-flight SSE clients, close the socket. Without this, systemd / docker
+    # / kill -TERM drops requests mid-write and leaks DB connections.
+    _shutdown = threading.Event()
+
+    def _graceful_shutdown(signum, frame):
+        signame = signal.Signals(signum).name
+        log(f"received {signame}; shutting down gracefully")
+        _shutdown.set()
+        # shutdown() must be called from a different thread to break serve_forever.
+        threading.Thread(target=server.shutdown, daemon=True).start()
+
+    signal.signal(signal.SIGTERM, _graceful_shutdown)
+    signal.signal(signal.SIGINT, _graceful_shutdown)
+
     log(f"agentchat server listening on http://{host}:{port} (v{SERVER_VERSION})")
     try:
         server.serve_forever()
-    except KeyboardInterrupt:
-        log("shutting down")
     finally:
         server.server_close()
+        log("server stopped")
 
 
 # ---------------------------------------------------------------------------

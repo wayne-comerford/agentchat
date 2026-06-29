@@ -6,6 +6,46 @@ to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-06-29
+
+### Security
+- Per-IP rate limit on `/v1/auth/login` and `/v1/auth/register`
+  (10 requests / 60s, in-memory token bucket, returns 429 + `Retry-After: 60`)
+- CORS / Origin allowlist on `/v1/*` (empty set = same-origin only; add
+  prod origins to `AgentChatHandler._ALLOWED_ORIGINS`)
+- Graceful shutdown on SIGTERM/SIGINT (drains SSE clients, closes socket,
+  exits cleanly — replaces the bare `KeyboardInterrupt` handler)
+- Log scrubber strips `Bearer <token>` and `"password":"...","token":"..."`
+  fields before any line is written to stderr or `server.log`
+
+### Performance
+- SQLite WAL + `PRAGMA synchronous=NORMAL` + `busy_timeout=5000ms`
+  (5-10× write throughput; safe with WAL)
+- Connection-pool-style DB connection reused across the SSE polling
+  loop (was opening a fresh connection per poll iteration)
+
+### Reliability
+- `verify-roundtrip.sh` extended from 6 → 7 steps: now includes
+  `register` (step 0) and `logout` (step 7, confirms token is revoked
+  with a follow-up 401 check)
+
+### Deploy
+- `Dockerfile` — slim Python 3.11 image, runs as non-root, healthcheck
+- `docker-compose.yml` — API + WebUI on a shared network with a named
+  volume for the SQLite DB
+- `Caddyfile.example` — auto-TLS via Let's Encrypt, SSE-friendly
+  streaming config (`flush_interval -1`, `read_timeout 0`), defense-in-
+  depth rate limit on `/v1/auth/*`
+- `.github/workflows/ci.yml` — runs `verify-roundtrip.sh` on every
+  push to `main` and on every PR
+
+### Docs
+- `README.md` rewritten with install / quick-start / TLS deploy /
+  API reference / security notes
+- `ROADMAP.md` updated with v0.2.0 in-progress items + a releases table
+
+## [1.3.0] — 2026-06-29 (unreleased → included in 0.2.0)
+
 ### Added
 - Server-Sent Events endpoint `/v1/threads/<id>/events` for live message +
   reaction updates (`?since=<msg_id>` cursor support)

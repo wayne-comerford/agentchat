@@ -1,0 +1,43 @@
+# agentchat — single-host compose for dev + small prod
+#
+# Brings up the API (:7878) and WebUI (:7879) on a shared network, with
+# a named volume for the SQLite DB. Add a reverse proxy (Caddyfile
+# included below) in front for TLS in production.
+
+services:
+  api:
+    build: .
+    image: agentchat:latest
+    container_name: agentchat-api
+    restart: unless-stopped
+    environment:
+      AGENTCHAT_HOME: /data
+    volumes:
+      - agentchat-data:/data
+    ports:
+      - "127.0.0.1:7878:7878"   # bind to loopback only — proxy in front
+    command: ["python3", "-m", "agentchat", "serve", "--host", "0.0.0.0", "--port", "7878"]
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request,sys; r=urllib.request.urlopen('http://127.0.0.1:7878/health',timeout=2); sys.exit(0 if r.status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  web:
+    image: agentchat:latest
+    container_name: agentchat-web
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      AGENTCHAT_API: http://api:7878
+    volumes:
+      - agentchat-data:/data:ro  # read-only access to the DB for thread listing
+    ports:
+      - "127.0.0.1:7879:7879"
+    command: ["python3", "-m", "agentchat", "web", "--host", "0.0.0.0", "--port", "7879", "--api", "http://api:7878"]
+
+volumes:
+  agentchat-data:

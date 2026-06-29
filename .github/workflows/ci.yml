@@ -1,0 +1,60 @@
+# GitHub Actions CI for agentchat
+#
+# Runs verify-roundtrip.sh against a freshly-spawned API + WebUI on every
+# push and PR. Catches regressions before they reach main.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  verify:
+    name: verify-roundtrip (Python 3.11)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Smoke import (catches syntax errors)
+        run: |
+          python3 -c "import agentchat; print('agentchat', agentchat.SERVER_VERSION)"
+
+      - name: Start API in background
+        run: |
+          mkdir -p /tmp/agentchat-home
+          AGENTCHAT_HOME=/tmp/agentchat-home nohup python3 -m agentchat serve --host 127.0.0.1 --port 7878 > /tmp/api.log 2>&1 &
+          echo "API PID: $!"
+
+      - name: Wait for API
+        run: |
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            if curl -fsS http://127.0.0.1:7878/health > /tmp/health.json 2>/dev/null; then
+              echo "API ready after ${i}s"
+              cat /tmp/health.json
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "API failed to start — last log:"
+          cat /tmp/api.log
+          exit 1
+
+      - name: Run verify-roundtrip.sh (7 steps)
+        run: |
+          bash scripts/verify-roundtrip.sh wayne "ci-test" hermes-chappy "http://127.0.0.1:7878" \
+            || (echo "::warning::verify-roundtrip on 'hermes-chappy' failed (may not exist in fresh DB)"; bash scripts/verify-roundtrip.sh wayne "ci-test" default "http://127.0.0.1:7878")
+
+      - name: Tear down
+        if: always()
+        run: |
+          pkill -f "python3 -m agentchat serve" || true
