@@ -163,6 +163,60 @@ CREATE TABLE IF NOT EXISTS thread_members (
 );
 CREATE INDEX IF NOT EXISTS idx_member ON thread_members(agent_name);
 
+-- v0.1.0 auth tables (Phase 1, real auth)
+-- users hold bcrypt/scrypt-hashed passwords. workspace scoping is
+-- enforced on every API call by joining through api_tokens.
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT UNIQUE NOT NULL,
+    password_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    last_login_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS workspaces (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    slug TEXT UNIQUE NOT NULL,
+    name TEXT NOT NULL,
+    owner_user_id INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (owner_user_id) REFERENCES users(id)
+);
+
+-- role: 'owner' | 'admin' | 'member'
+CREATE TABLE IF NOT EXISTS workspace_members (
+    workspace_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    role TEXT NOT NULL CHECK(role IN ('owner','admin','member')),
+    joined_at TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, user_id),
+    FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_wm_user ON workspace_members(user_id);
+
+-- api_tokens hold SHA256-hashed bearer tokens. Plaintext is never
+-- stored. token_hash UNIQUE so collisions are detected.
+-- scope: 'admin' (workspace admin) | 'member' | 'agent' (system agent)
+CREATE TABLE IF NOT EXISTS api_tokens (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    token_hash TEXT UNIQUE NOT NULL,
+    user_id INTEGER,
+    workspace_id INTEGER,
+    name TEXT,
+    scope TEXT NOT NULL DEFAULT 'member',
+    expires_at TEXT NOT NULL,
+    refresh_expires_at TEXT,
+    created_at TEXT NOT NULL,
+    last_used_at TEXT,
+    revoked_at TEXT,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_tokens_user ON api_tokens(user_id, expires_at);
+CREATE INDEX IF NOT EXISTS idx_tokens_ws ON api_tokens(workspace_id);
+CREATE INDEX IF NOT EXISTS idx_tokens_active ON api_tokens(revoked_at, expires_at);
+
 CREATE TABLE IF NOT EXISTS thread_messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     msg_id TEXT UNIQUE NOT NULL,
@@ -278,6 +332,315 @@ def agent_lookup_token(name: str, token: str) -> Optional[sqlite3.Row]:
         ).fetchone()
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# v0.1.0 real auth (Phase 1): users, workspaces, hashed bearer tokens.
+# Passwords use stdlib hashlib.scrypt with conservative params; tokens are
+# stored as SHA256 hashes only. Tokens never leave the client as plaintext
+# after issue except in the issue response.
+# ---------------------------------------------------------------------------
+
+# Scrypt cost params. n=2**15 is ~80ms on a modern x86; r=8 p=1 are
+# recommended defaults from the scrypt paper. Bumped if you need harder.
+_SCRYPT_N = 1 << 15
+_SCRYPT_R = 8
+_SCRYPT_P = 1
+_SCRYPT_DKLEN = 64
+
+# Token TTLs
+_TOKEN_TTL_SECONDS = 60 * 60            # 1 hour
+_REFRESH_TTL_SECONDS = 60 * 60 * 24 * 30  # 30 days
+
+
+def _hash_password(password: str) -> str:
+    """Scrypt-hash a password with a per-hash random salt.
+
+    Stored format: 'scrypt$<hex-salt>$<hex-hash>' so we can grow into
+    bcrypt/argon2 later by adding a new prefix and dispatching on it.
+
+    maxmem=64 MiB — explicit because OpenSSL's default cap (~32 MiB) is
+    too low for n=2**15 on some systems, causing 'memory limit exceeded'.
+    """
+    salt = secrets.token_bytes(16)
+    hk = hashlib.scrypt(
+        password.encode("utf-8"),
+        salt=salt,
+        n=_SCRYPT_N,
+        r=_SCRYPT_R,
+        p=_SCRYPT_P,
+        dklen=_SCRYPT_DKLEN,
+        maxmem=64 * 1024 * 1024,
+    )
+    return f"scrypt${salt.hex()}${hk.hex()}"
+
+
+def _verify_password(password: str, stored: str) -> bool:
+    """Constant-time-ish verification of a stored hash."""
+    try:
+        algo, salt_hex, hk_hex = stored.split("$", 2)
+    except ValueError:
+        return False
+    if algo != "scrypt":
+        return False
+    try:
+        salt = bytes.fromhex(salt_hex)
+        expected = bytes.fromhex(hk_hex)
+    except ValueError:
+        return False
+    candidate = hashlib.scrypt(
+        password.encode("utf-8"),
+        salt=salt,
+        n=_SCRYPT_N,
+        r=_SCRYPT_R,
+        p=_SCRYPT_P,
+        dklen=len(expected),
+        maxmem=64 * 1024 * 1024,
+    )
+    # Constant-time compare
+    return hmac.compare_digest(candidate, expected)
+
+
+def _token_new() -> str:
+    """Cryptographically random bearer token, URL-safe, ~256 bits entropy."""
+    return secrets.token_urlsafe(32)
+
+
+def _token_hash(token: str) -> str:
+    """SHA-256 of the token. DB stores only this. Plaintext token is
+    shown to the client ONCE at issue and never persisted."""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def user_register(
+    username: str,
+    password: str,
+    workspace_name: str,
+    workspace_slug: Optional[str] = None,
+) -> dict:
+    """Create a user + first workspace. Caller becomes owner.
+
+    First-user-becomes-admin pattern. Refuses if username already exists.
+    Returns dict {user: {...}, workspace: {...}, token, refresh_token, expires_at}.
+    """
+    if not username or not password or not workspace_name:
+        raise ValueError("username, password, workspace_name required")
+    if len(password) < 8:
+        raise ValueError("password must be at least 8 characters")
+    if len(username) > 64 or not re.match(r"^[a-zA-Z0-9_.\-@]+$", username):
+        raise ValueError("invalid username (1-64 chars, [a-z0-9_.-@])")
+    slug = workspace_slug or re.sub(r"[^a-z0-9-]+", "-", workspace_name.lower()).strip("-")[:48] or "default"
+    if not slug:
+        slug = "default"
+
+    db_init()
+    conn = db_connect()
+    try:
+        existing = conn.execute("SELECT 1 FROM users WHERE username=?", (username,)).fetchone()
+        if existing:
+            raise ValueError("username already exists")
+        existing_ws = conn.execute("SELECT 1 FROM workspaces WHERE slug=?", (slug,)).fetchone()
+        if existing_ws:
+            raise ValueError(f"workspace slug '{slug}' already exists")
+
+        now = now_iso()
+        cur = conn.execute(
+            "INSERT INTO users(username, password_hash, created_at) VALUES (?,?,?)",
+            (username, _hash_password(password), now),
+        )
+        user_id = cur.lastrowid
+        cur = conn.execute(
+            "INSERT INTO workspaces(slug, name, owner_user_id, created_at) VALUES (?,?,?,?)",
+            (slug, workspace_name, user_id, now),
+        )
+        workspace_id = cur.lastrowid
+        conn.execute(
+            "INSERT INTO workspace_members(workspace_id, user_id, role, joined_at) VALUES (?,?,?,?)",
+            (workspace_id, user_id, "owner", now),
+        )
+
+        issued = _token_issue(conn, user_id, workspace_id, "register", "admin")
+    finally:
+        conn.close()
+
+    return {
+        "user": {"id": user_id, "username": username},
+        "workspace": {"id": workspace_id, "slug": slug, "name": workspace_name, "role": "owner"},
+        **issued,
+    }
+
+
+def user_login(username: str, password: str) -> Optional[dict]:
+    """Verify password and issue a fresh token + refresh. Returns None
+    if the username/password is wrong (or user has no workspace)."""
+    db_init()
+    conn = db_connect()
+    try:
+        row = conn.execute(
+            "SELECT id, username, password_hash FROM users WHERE username=?",
+            (username,),
+        ).fetchone()
+        if row is None:
+            return None  # caller distinguishes "no such user" from "wrong pw"
+        if not _verify_password(password, row["password_hash"]):
+            return None
+        # First workspace (or sole workspace) becomes the active context.
+        ws = conn.execute(
+            "SELECT w.id AS ws_id, w.slug, w.name, wm.role "
+            "FROM workspace_members wm JOIN workspaces w ON w.id = wm.workspace_id "
+            "WHERE wm.user_id = ? ORDER BY wm.joined_at LIMIT 1",
+            (row["id"],),
+        ).fetchone()
+        if ws is None:
+            # User exists but has no workspace (shouldn't happen post-register,
+            # but guard for legacy users migrated from tokens.json).
+            return None
+        user_id = int(row["id"])
+        ws_id = int(ws["ws_id"])
+        conn.execute(
+            "UPDATE users SET last_login_at=? WHERE id=?",
+            (now_iso(), user_id),
+        )
+        issued = _token_issue(conn, user_id, ws_id, "login", "admin")
+    finally:
+        conn.close()
+    return {
+        "user": {"id": user_id, "username": str(row["username"])},
+        "workspace": {
+            "id": ws_id, "slug": str(ws["slug"]), "name": str(ws["name"]), "role": str(ws["role"]),
+        },
+        **issued,
+    }
+
+
+def _token_issue(
+    conn: sqlite3.Connection,
+    user_id: int,
+    workspace_id: int,
+    name: str,
+    scope: str,
+) -> dict:
+    """Insert a new token row. Returns {token, refresh_token, expires_at}.
+
+    Token plaintext is returned ONCE here. Only token_hash is persisted.
+    """
+    plain = _token_new()
+    refresh = _token_new()
+    now = now_iso()
+    expires_at = (
+        datetime.now(timezone.utc)
+        + timedelta(seconds=_TOKEN_TTL_SECONDS)
+    ).isoformat()
+    refresh_expires_at = (
+        datetime.now(timezone.utc)
+        + timedelta(seconds=_REFRESH_TTL_SECONDS)
+    ).isoformat()
+    conn.execute(
+        "INSERT INTO api_tokens("
+        "  token_hash, user_id, workspace_id, name, scope,"
+        "  expires_at, refresh_expires_at, created_at"
+        ") VALUES (?,?,?,?,?,?,?,?)",
+        (
+            _token_hash(plain), user_id, workspace_id, name, scope,
+            expires_at, refresh_expires_at, now,
+        ),
+    )
+    return {
+        "token": plain,
+        "refresh_token": refresh,  # NOTE: not yet stored; see _token_refresh below
+        "expires_at": expires_at,
+        "token_type": "Bearer",
+    }
+
+
+def token_lookup(plain: str) -> Optional[sqlite3.Row]:
+    """Resolve a bearer token to its row, if not expired and not revoked."""
+    if not plain:
+        return None
+    db_init()
+    conn = db_connect()
+    try:
+        row = conn.execute(
+            "SELECT t.id, t.user_id, t.workspace_id, t.scope, t.expires_at, "
+            "       u.username AS name, u.username, "
+            "       w.slug AS workspace_slug "
+            "FROM api_tokens t "
+            "LEFT JOIN users u ON u.id = t.user_id "
+            "LEFT JOIN workspaces w ON w.id = t.workspace_id "
+            "WHERE t.token_hash = ? AND t.revoked_at IS NULL",
+            (_token_hash(plain),),
+        ).fetchone()
+        if row is None:
+            return None
+        # Check expiry
+        if row["expires_at"] < now_iso():
+            return None
+        # Bump last_used_at (best-effort, ignore errors)
+        try:
+            conn.execute(
+                "UPDATE api_tokens SET last_used_at=? WHERE id=?",
+                (now_iso(), row["id"]),
+            )
+        except sqlite3.Error:
+            pass
+        return row
+    finally:
+        conn.close()
+
+
+def token_revoke(plain: str) -> bool:
+    """Mark a token as revoked. Returns True if a row was updated."""
+    db_init()
+    conn = db_connect()
+    try:
+        cur = conn.execute(
+            "UPDATE api_tokens SET revoked_at=? "
+            "WHERE token_hash=? AND revoked_at IS NULL",
+            (now_iso(), _token_hash(plain)),
+        )
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def user_workspace_create(user_id: int, name: str, slug: Optional[str] = None) -> dict:
+    """Add a new workspace owned by the given user."""
+    if not name:
+        raise ValueError("name required")
+    s = slug or re.sub(r"[^a-z0-9-]+", "-", name.lower()).strip("-")[:48] or "default"
+    db_init()
+    conn = db_connect()
+    try:
+        if conn.execute("SELECT 1 FROM workspaces WHERE slug=?", (s,)).fetchone():
+            raise ValueError(f"workspace slug '{s}' already exists")
+        now = now_iso()
+        cur = conn.execute(
+            "INSERT INTO workspaces(slug, name, owner_user_id, created_at) VALUES (?,?,?,?)",
+            (s, name, user_id, now),
+        )
+        ws_id = cur.lastrowid
+        conn.execute(
+            "INSERT INTO workspace_members(workspace_id, user_id, role, joined_at) VALUES (?,?,?,?)",
+            (ws_id, user_id, "owner", now),
+        )
+    finally:
+        conn.close()
+    return {"id": ws_id, "slug": s, "name": name, "role": "owner"}
+
+
+def user_workspaces_list(user_id: int) -> list[dict]:
+    db_init()
+    conn = db_connect()
+    try:
+        rows = conn.execute(
+            "SELECT w.id, w.slug, w.name, wm.role, wm.joined_at "
+            "FROM workspace_members wm JOIN workspaces w ON w.id = wm.workspace_id "
+            "WHERE wm.user_id = ? ORDER BY wm.joined_at",
+            (user_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [dict(r) for r in rows]
 
 
 def agent_exists(name: str) -> bool:
@@ -1080,15 +1443,88 @@ class AgentChatHandler(http.server.BaseHTTPRequestHandler):
         except json.JSONDecodeError as e:
             raise ValueError(f"invalid JSON: {e}") from e
 
+    # --- v0.1.0 auth handlers ---
+    def _handle_auth_register(self) -> None:
+        try:
+            body = self._read_json()
+        except ValueError as e:
+            return self._send_json(400, err(str(e)))
+        username = (body.get("username") or "").strip()
+        password = body.get("password") or ""
+        workspace_name = (body.get("workspace_name") or "").strip()
+        workspace_slug = (body.get("workspace_slug") or "").strip() or None
+        if not username or not password or not workspace_name:
+            return self._send_json(400, err("username, password, workspace_name required"))
+        try:
+            result = user_register(username, password, workspace_name, workspace_slug)
+        except ValueError as e:
+            return self._send_json(409, err(str(e)))
+        except sqlite3.IntegrityError as e:
+            return self._send_json(409, err(f"conflict: {e}"))
+        return self._send_json(201, result)
+
+    def _handle_auth_login(self) -> None:
+        try:
+            body = self._read_json()
+        except ValueError as e:
+            return self._send_json(400, err(str(e)))
+        username = (body.get("username") or "").strip()
+        password = body.get("password") or ""
+        if not username or not password:
+            return self._send_json(400, err("username and password required"))
+        result = user_login(username, password)
+        if result is None:
+            return self._send_json(401, err("invalid credentials"))
+        return self._send_json(200, result)
+
+    def _handle_auth_refresh(self) -> None:
+        # Phase 1 simplification: re-issue by re-authenticating with
+        # username+password. Full refresh_token grant flow is Phase 2.
+        return self._handle_auth_login()
+
+    def _handle_auth_logout(self) -> None:
+        # Logout is just token revocation. No auth required (so a leaked
+        # token can still be killed even after the user changes password).
+        header = self.headers.get("Authorization", "")
+        if not header.startswith("Bearer "):
+            return self._send_json(400, err("Bearer token required to logout"))
+        token = header[len("Bearer "):].strip()
+        if not token:
+            return self._send_json(400, err("empty token"))
+        # Legacy tokens can't be revoked (no DB row); just ack.
+        if ":" in token:
+            return self._send_json(200, {"ok": True, "note": "legacy token; rotation required"})
+        revoked = token_revoke(token)
+        return self._send_json(200, {"ok": True, "revoked": revoked})
+
+    def _handle_workspace_create(self, row: sqlite3.Row) -> None:
+        try:
+            body = self._read_json()
+        except ValueError as e:
+            return self._send_json(400, err(str(e)))
+        name = (body.get("name") or "").strip()
+        slug = (body.get("slug") or "").strip() or None
+        if not name:
+            return self._send_json(400, err("name required"))
+        try:
+            ws = user_workspace_create(int(row["user_id"]), name, slug)
+        except ValueError as e:
+            return self._send_json(409, err(str(e)))
+        return self._send_json(201, {"workspace": ws})
+
     def _auth(self) -> Optional[sqlite3.Row]:
         header = self.headers.get("Authorization", "")
         if not header.startswith("Bearer "):
             return None
         token = header[len("Bearer "):].strip()
-        if ":" not in token:
+        if not token:
             return None
-        name, secret = token.split(":", 1)
-        return agent_lookup_token(name, secret)
+        # v1.0 legacy: name:secret from tokens.json
+        if ":" in token:
+            name, secret = token.split(":", 1)
+            return agent_lookup_token(name, secret)
+        # v0.1.0+: opaque bearer token, SHA256-hashed in api_tokens
+        return token_lookup(token)
 
     # --- routes ---
     def do_DELETE(self) -> None:  # noqa: N802
@@ -1464,6 +1900,32 @@ class AgentChatHandler(http.server.BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         url = urllib.parse.urlparse(self.path)
         path = url.path.rstrip("/") or "/"
+
+        # --- v0.1.0 auth endpoints (no Bearer required) ---
+        if path == "/v1/auth/register":
+            return self._handle_auth_register()
+        if path == "/v1/auth/login":
+            return self._handle_auth_login()
+        if path == "/v1/auth/refresh":
+            return self._handle_auth_refresh()
+        if path == "/v1/auth/logout":
+            return self._handle_auth_logout()
+        if path == "/v1/auth/whoami":
+            row = self._auth()
+            if not row:
+                return self._send_json(401, err("unauthorized"))
+            return self._send_json(200, {
+                "user": {"id": row["user_id"], "username": row["name"]},
+                "workspace": {"id": row["workspace_id"], "slug": row["workspace_slug"]},
+                "scope": row["scope"],
+                "expires_at": row["expires_at"],
+            })
+        if path == "/v1/workspaces":
+            row = self._auth()
+            if not row:
+                return self._send_json(401, err("unauthorized"))
+            return self._handle_workspace_create(row)
+
         row = self._auth()
         if not row:
             return self._send_json(401, err("unauthorized"))
