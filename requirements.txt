@@ -1,0 +1,10 @@
+# agentchat is pure-Python stdlib + optional extras. No runtime deps required.
+# Dev/test deps listed below.
+
+# --- runtime ---
+# (none — only the Python 3.11+ standard library is used at runtime)
+
+# --- dev / test (pip install -r requirements-dev.txt) ---
+pytest>=8.0
+pytest-asyncio>=0.23
+requests>=2.31

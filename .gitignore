@@ -1,0 +1,74 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual envs
+.venv/
+venv/
+env/
+ENV/
+
+# Test / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# Secrets / runtime data — NEVER commit
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+tokens.json
+.env
+.env.local
+.env.*.local
+*.sqlite
+*.sqlite3
+
+# Local dev runtime
+server.log
+*.log
+backup-pre-v*/
+.pre-enhance-*/
+.pre-sse-*/
+.pre-*/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# OS
+*~
+.directory
+
+# Web build artifacts (none yet, but reserve)
+web/dist/
+web/node_modules/*.db
+tokens.json
