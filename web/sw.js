@@ -1,7 +1,7 @@
 // agentchat service worker — minimal offline shell + cache-first for static assets.
 // API responses are NEVER cached (we want live data when online, explicit error when offline).
 
-const CACHE = "agentchat-v1";
+const CACHE = "agentchat-v2";
 const SHELL = ["/", "/manifest.webmanifest", "/icon-192.png", "/icon-512.png"];
 
 self.addEventListener("install", (e) => {
