@@ -349,7 +349,7 @@ _SCRYPT_P = 1
 _SCRYPT_DKLEN = 64
 
 # Token TTLs
-_TOKEN_TTL_SECONDS = 60 * 60            # 1 hour
+_TOKEN_TTL_SECONDS = 60 * 60 * 24        # 24 hours
 _REFRESH_TTL_SECONDS = 60 * 60 * 24 * 30  # 30 days
 
 

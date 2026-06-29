@@ -922,8 +922,9 @@ input, textarea { font: inherit; color: inherit; background: none; border: none;
     <button class="btn-primary" id="login-btn">Sign in</button>
 
     <div class="login-hint">
-      Tokens live in <code>tokens.json</code> on the server.
-      Your name is paired with the secret: <code>bearer name:secret</code>.
+      Issued by <code>/v1/auth/login</code>. Send as
+      <code>Authorization: Bearer &lt;token&gt;</code>.<br>
+      Tokens are SHA256-hashed in <code>api_tokens</code> &mdash; never stored plaintext.
     </div>
   </div>
 </div>
