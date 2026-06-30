@@ -2657,6 +2657,201 @@ def cmd_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+# ===========================================================================
+# MCP server (Model Context Protocol) — JSON-RPC 2.0 over stdio
+# ===========================================================================
+# Reference: https://modelcontextprotocol.io/specification/2025-06-18
+# Minimal viable implementation: tools list + tools/call.
+# Resources / prompts / sampling are stubs.
+#
+# Tools exposed:
+#   - whoami            → agent identity + workspace
+#   - list_threads      → threads I'm a member of
+#   - read_messages     → latest N messages from a thread
+#   - send_message      → post a message to a thread
+#   - search            → cross-thread full-text search
+
+_MCP_SERVER_INFO = {
+    "name": "agentchat",
+    "version": SERVER_VERSION,
+}
+
+_MCP_TOOLS = [
+    {
+        "name": "whoami",
+        "description": "Return the current agent identity and workspace info.",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "name": "list_threads",
+        "description": "List the threads this agent is a member of.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "description": "max threads to return (default 20)"},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "read_messages",
+        "description": "Read the latest messages from a thread.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "thread_id": {"type": "string", "description": "thread ID"},
+                "limit": {"type": "integer", "description": "max messages (default 20)"},
+                "unread_only": {"type": "boolean", "description": "only unread messages"},
+            },
+            "required": ["thread_id"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "send_message",
+        "description": "Post a message to a thread.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "thread_id": {"type": "string", "description": "thread ID"},
+                "body": {"type": "string", "description": "message body"},
+            },
+            "required": ["thread_id", "body"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "search",
+        "description": "Full-text search across all threads the agent is in.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "search query"},
+                "limit": {"type": "integer", "description": "max results (default 20)"},
+            },
+            "required": ["query"],
+            "additionalProperties": False,
+        },
+    },
+]
+
+
+def _mcp_call_tool(api: str, token: Optional[str], name: str, arguments: dict) -> dict:
+    """Dispatch a JSON-RPC tools/call to the matching agentchat HTTP API endpoint."""
+    req_headers = {"Accept": "application/json"}
+    if token:
+        req_headers["Authorization"] = f"Bearer {token}"
+    base = api.rstrip("/")
+
+    def _get(path: str, **params) -> dict:
+        if params:
+            from urllib.parse import urlencode
+            path = f"{path}?{urlencode({k: v for k, v in params.items() if v is not None})}"
+        req = urllib.request.Request(base + path, headers=req_headers)
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read())
+
+    def _post(path: str, body: dict) -> dict:
+        req = urllib.request.Request(
+            base + path, method="POST",
+            data=json.dumps(body).encode("utf-8"),
+            headers={**req_headers, "Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read())
+
+    if name == "whoami":
+        return _get("/v1/whoami")
+    if name == "list_threads":
+        return _get("/v1/threads", limit=arguments.get("limit"))
+    if name == "read_messages":
+        path = f"/v1/threads/{urllib.parse.quote(arguments['thread_id'], safe='')}/messages"
+        return _get(path, limit=arguments.get("limit"),
+                    unread=arguments.get("unread_only"))
+    if name == "send_message":
+        path = f"/v1/threads/{urllib.parse.quote(arguments['thread_id'], safe='')}/messages"
+        return _post(path, {"body": arguments["body"]})
+    if name == "search":
+        return _get("/v1/search", q=arguments["query"], limit=arguments.get("limit"))
+    raise ValueError(f"unknown tool: {name}")
+
+
+def _mcp_tool_result_text(value: Any) -> dict:
+    """Wrap an MCP tool result as a text content block (per MCP spec)."""
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, indent=2)
+    return {"content": [{"type": "text", "text": text}], "isError": False}
+
+
+def _mcp_dispatch(req: dict, api: str, token: Optional[str]) -> Optional[dict]:
+    """Return a JSON-RPC response dict, or None for notifications (no response)."""
+    method = req.get("method")
+    rid = req.get("id")
+    params = req.get("params") or {}
+
+    if method == "initialize":
+        return {
+            "jsonrpc": "2.0", "id": rid,
+            "result": {
+                "protocolVersion": "2025-06-18",
+                "serverInfo": _MCP_SERVER_INFO,
+                "capabilities": {"tools": {"listChanged": False}},
+            },
+        }
+    if method == "ping":
+        return {"jsonrpc": "2.0", "id": rid, "result": {}}
+    if method == "tools/list":
+        return {"jsonrpc": "2.0", "id": rid, "result": {"tools": _MCP_TOOLS}}
+    if method == "tools/call":
+        try:
+            result = _mcp_call_tool(api, token, params["name"], params.get("arguments") or {})
+            return {"jsonrpc": "2.0", "id": rid, "result": _mcp_tool_result_text(result)}
+        except urllib.error.HTTPError as e:
+            err_body = e.read().decode("utf-8", errors="replace")
+            return {
+                "jsonrpc": "2.0", "id": rid,
+                "result": {
+                    "content": [{"type": "text", "text": f"HTTP {e.code}: {err_body}"}],
+                    "isError": True,
+                },
+            }
+        except Exception as e:
+            return {
+                "jsonrpc": "2.0", "id": rid,
+                "error": {"code": -32603, "message": f"tool execution failed: {e}"},
+            }
+    # Notifications or unknown methods — no response.
+    if rid is None:
+        return None
+    return {"jsonrpc": "2.0", "id": rid,
+            "error": {"code": -32601, "message": f"method not found: {method}"}}
+
+
+def cmd_mcp(args: argparse.Namespace) -> int:
+    """Run an MCP server on stdio. Speaks JSON-RPC 2.0 line-delimited."""
+    log(f"MCP server starting (api={args.api}, token={'set' if args.token else 'unset'})")
+    # Line-delimited JSON: read newline-terminated JSON-RPC requests from stdin,
+    # write responses to stdout. Keep stderr for our own logs (per MCP convention).
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            req = json.loads(line)
+        except json.JSONDecodeError as e:
+            sys.stdout.write(json.dumps({
+                "jsonrpc": "2.0", "id": None,
+                "error": {"code": -32700, "message": f"parse error: {e}"},
+            }) + "\n")
+            sys.stdout.flush()
+            continue
+        resp = _mcp_dispatch(req, args.api, args.token)
+        if resp is not None:
+            sys.stdout.write(json.dumps(resp, ensure_ascii=False) + "\n")
+            sys.stdout.flush()
+    log("MCP server stopped (stdin closed)")
+    return 0
+
+
 def _client_from_args(args: argparse.Namespace) -> AgentChatClient:
     cfg = _load_client_cfg(args)
     if not cfg.get("base_url") or not cfg.get("name") or not cfg.get("token"):
@@ -3755,6 +3950,28 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument("--host", default=DEFAULT_BIND)
     p_serve.add_argument("--port", type=int, default=DEFAULT_PORT)
     p_serve.set_defaults(func=cmd_serve)
+
+    # --- MCP server (stdio transport) ---
+    # Runs as `python3 -m agentchat mcp`. Speaks the Model Context Protocol
+    # JSON-RPC over stdio so any MCP-capable agent (Claude Desktop, Hermes,
+    # OpenClaw, Goose, Cursor, ...) can use agentchat as transport.
+    # Tools exposed: whoami, list_threads, read_messages, send_message.
+    p_mcp = sub.add_parser(
+        "mcp",
+        help="run an MCP (Model Context Protocol) server on stdio"
+    )
+    p_mcp.add_argument(
+        "--api",
+        default=os.environ.get("AGENTCHAT_API", f"http://127.0.0.1:{DEFAULT_PORT}"),
+        help="base URL of the agentchat HTTP API (default: $AGENTCHAT_API or 127.0.0.1:%d)" % DEFAULT_PORT,
+    )
+    p_mcp.add_argument(
+        "--token",
+        default=os.environ.get("AGENTCHAT_TOKEN"),
+        help="bearer token for the API (default: $AGENTCHAT_TOKEN). "
+             "In a Claude Desktop config you can paste the token directly.",
+    )
+    p_mcp.set_defaults(func=cmd_mcp)
 
     p_id = sub.add_parser(
         "set-identity", help="save local client identity (base_url, name, token)"
