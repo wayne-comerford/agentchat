@@ -72,7 +72,7 @@ LOG_PATH = AGENTCHAT_HOME / "server.log"
 
 DEFAULT_PORT = int(os.environ.get("AGENTCHAT_PORT", "7878"))
 DEFAULT_BIND = os.environ.get("AGENTCHAT_BIND", "0.0.0.0")
-SERVER_VERSION = "0.2.0"
+SERVER_VERSION = "0.3.0"
 
 MAX_BODY_BYTES = 64 * 1024  # 64 KiB per message
 THREAD_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_\-.]{0,63}$")
@@ -125,10 +125,14 @@ _CRED_RE = re.compile(r'"(password|token|refresh_token)"\s*:\s*"[^"]*"')
 
 
 def log(msg: str) -> None:
-    # Strip anything that looks like a bearer token or credential before writing.
-    sanitized = _BEARER_RE.sub("Bearer ***", msg)
-    sanitized = _CRED_RE.sub(r'"\1":"***"', sanitized)
-    line = f"[{now_iso()}] {sanitized}"
+    # v0.3: PASSWORD_RESET_TOKEN lines are whitelisted (intentional plaintext
+    # delivery channel for the self-hosted admin). Strip everything else.
+    if msg.startswith("PASSWORD_RESET_TOKEN:"):
+        line = f"[{now_iso()}] {msg}"
+    else:
+        sanitized = _BEARER_RE.sub("Bearer ***", msg)
+        sanitized = _CRED_RE.sub(r'"\1":"***"', sanitized)
+        line = f"[{now_iso()}] {sanitized}"
     print(line, file=sys.stderr)
     try:
         with LOG_PATH.open("a") as f:
@@ -253,6 +257,18 @@ CREATE TABLE IF NOT EXISTS api_tokens (
 CREATE INDEX IF NOT EXISTS idx_tokens_user ON api_tokens(user_id, expires_at);
 CREATE INDEX IF NOT EXISTS idx_tokens_ws ON api_tokens(workspace_id);
 CREATE INDEX IF NOT EXISTS idx_tokens_active ON api_tokens(revoked_at, expires_at);
+
+-- v0.3: password reset tokens. One-time use, 1h expiry, hashed in DB.
+CREATE TABLE IF NOT EXISTS password_resets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    token_hash TEXT UNIQUE NOT NULL,
+    expires_at TEXT NOT NULL,
+    used_at TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_resets_user ON password_resets(user_id, expires_at);
 
 CREATE TABLE IF NOT EXISTS thread_messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -654,6 +670,74 @@ def token_revoke(plain: str) -> bool:
             (now_iso(), _token_hash(plain)),
         )
         return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def password_reset_request(username: str) -> Optional[str]:
+    """Issue a one-time password reset token for `username`. Returns the
+    plaintext token (caller is responsible for delivery — we log it). Returns
+    None if the username doesn't exist (so we can distinguish from valid).
+
+    Tokens are 1h-expiry, SHA256-hashed before persistence, single-use.
+    """
+    db_init()
+    conn = db_connect()
+    try:
+        row = conn.execute(
+            "SELECT id FROM users WHERE username=?", (username,)
+        ).fetchone()
+        if row is None:
+            return None
+        user_id = int(row["id"])
+        plain = secrets.token_urlsafe(32)
+        token_hash = _token_hash(plain)
+        now = now_iso()
+        expires = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+        conn.execute(
+            "INSERT INTO password_resets(user_id, token_hash, expires_at, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (user_id, token_hash, expires, now),
+        )
+        return plain
+    finally:
+        conn.close()
+
+
+def password_reset_consume(plain_token: str, new_password: str) -> bool:
+    """Validate a reset token + apply the new password. Returns True on success.
+
+    On success: marks the token used_at, updates password_hash on the user,
+    revokes ALL existing api_tokens for that user (force logout everywhere).
+    """
+    if not plain_token or not new_password or len(new_password) < 8:
+        return False
+    db_init()
+    conn = db_connect()
+    try:
+        row = conn.execute(
+            "SELECT id, user_id, expires_at, used_at FROM password_resets "
+            "WHERE token_hash=?",
+            (_token_hash(plain_token),),
+        ).fetchone()
+        if row is None or row["used_at"] is not None or row["expires_at"] < now_iso():
+            return False
+        user_id = int(row["user_id"])
+        conn.execute(
+            "UPDATE password_resets SET used_at=? WHERE id=?",
+            (now_iso(), int(row["id"])),
+        )
+        conn.execute(
+            "UPDATE users SET password_hash=? WHERE id=?",
+            (_hash_password(new_password), user_id),
+        )
+        # Force-logout: revoke every existing token for this user.
+        conn.execute(
+            "UPDATE api_tokens SET revoked_at=? "
+            "WHERE user_id=? AND revoked_at IS NULL",
+            (now_iso(), user_id),
+        )
+        return True
     finally:
         conn.close()
 
@@ -1382,10 +1466,42 @@ class AgentChatHandler(http.server.BaseHTTPRequestHandler):
         log(f"{self.address_string()} {format % args}")
 
     # --- helpers ---
+    def _set_session_cookie(self, token: str, max_age: int = 86400) -> None:
+        """Queue a Set-Cookie header to be sent with the next response.
+        Stored on the instance and emitted by _send_json's header loop.
+        """
+        # Build attributes. Secure flag only when behind TLS (proxy or direct).
+        secure = (
+            self.headers.get("X-Forwarded-Proto", "").lower() == "https"
+            or getattr(self, "is_https", False)
+        )
+        attrs = [
+            "Path=/",
+            "HttpOnly",
+            f"Max-Age={max_age}",
+            "SameSite=Strict",
+        ]
+        if secure:
+            attrs.append("Secure")
+        # The instance attribute is consumed by _send_json and then cleared.
+        self._pending_set_cookie = f"agentchat_session={token}; " + "; ".join(attrs)
+
+    def _clear_session_cookie(self) -> None:
+        """Queue a cookie-clearing Set-Cookie header for the next response."""
+        self._pending_set_cookie = (
+            "agentchat_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0"
+        )
+
     def _send_json(self, status: int, payload: Any) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        # v0.3: emit pending Set-Cookie if _set_session_cookie/_clear_session_cookie
+        # was called. Must be sent before end_headers.
+        pending_cookie = getattr(self, "_pending_set_cookie", None)
+        if pending_cookie:
+            self.send_header("Set-Cookie", pending_cookie)
+            self._pending_set_cookie = None
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -1532,6 +1648,8 @@ class AgentChatHandler(http.server.BaseHTTPRequestHandler):
             return self._send_json(409, err(str(e)))
         except sqlite3.IntegrityError as e:
             return self._send_json(409, err(f"conflict: {e}"))
+        # v0.3: set session cookie (browser auto-includes for SSE/EventSource).
+        self._set_session_cookie(result["token"])
         return self._send_json(201, result)
 
     def _handle_auth_login(self) -> None:
@@ -1546,6 +1664,8 @@ class AgentChatHandler(http.server.BaseHTTPRequestHandler):
         result = user_login(username, password)
         if result is None:
             return self._send_json(401, err("invalid credentials"))
+        # v0.3: set session cookie.
+        self._set_session_cookie(result["token"])
         return self._send_json(200, result)
 
     def _handle_auth_refresh(self) -> None:
@@ -1556,17 +1676,69 @@ class AgentChatHandler(http.server.BaseHTTPRequestHandler):
     def _handle_auth_logout(self) -> None:
         # Logout is just token revocation. No auth required (so a leaked
         # token can still be killed even after the user changes password).
-        header = self.headers.get("Authorization", "")
-        if not header.startswith("Bearer "):
-            return self._send_json(400, err("Bearer token required to logout"))
-        token = header[len("Bearer "):].strip()
+        # v0.3: cookie-based logout — accept token from Cookie OR Authorization.
+        token = None
+        cookie_header = self.headers.get("Cookie", "")
+        if cookie_header:
+            for part in cookie_header.split(";"):
+                k, _, v = part.strip().partition("=")
+                if k == "agentchat_session" and v:
+                    token = v
+                    break
         if not token:
-            return self._send_json(400, err("empty token"))
+            header = self.headers.get("Authorization", "")
+            if header.startswith("Bearer "):
+                token = header[len("Bearer "):].strip()
+        if not token:
+            return self._send_json(400, err("Bearer token or session cookie required to logout"))
         # Legacy tokens can't be revoked (no DB row); just ack.
         if ":" in token:
+            self._clear_session_cookie()
             return self._send_json(200, {"ok": True, "note": "legacy token; rotation required"})
         revoked = token_revoke(token)
+        self._clear_session_cookie()
         return self._send_json(200, {"ok": True, "revoked": revoked})
+
+    def _handle_auth_forgot(self) -> None:
+        # v0.3: forgot-password. We have no mailer, so we log the reset URL
+        # to server.log (the self-hosted admin reads it). For a real
+        # deployment, override AGENTCHAT_RESET_DELIVERY=smtp to send via SMTP
+        # (TODO v0.3.1).
+        try:
+            body = self._read_json()
+        except ValueError as e:
+            return self._send_json(400, err(str(e)))
+        username = (body.get("username") or "").strip()
+        if not username:
+            return self._send_json(400, err("username required"))
+        token = password_reset_request(username)
+        if token:
+            # Log the reset token to stderr/server.log under a whitelisted prefix
+            # that bypasses the log scrubber. In a multi-user setup the server
+            # admin relays this to the user (TODO v0.3.1: SMTP/webhook delivery).
+            log(f"PASSWORD_RESET_TOKEN: username={username} token={token}")
+        # Always return 200 with the same message — prevents user enumeration.
+        return self._send_json(200, {
+            "ok": True,
+            "message": "if that username exists, a reset token has been issued "
+                       "(check server logs in single-tenant mode)",
+        })
+
+    def _handle_auth_reset(self) -> None:
+        try:
+            body = self._read_json()
+        except ValueError as e:
+            return self._send_json(400, err(str(e)))
+        token = (body.get("token") or "").strip()
+        new_password = body.get("new_password") or ""
+        if not token or not new_password:
+            return self._send_json(400, err("token and new_password required"))
+        if len(new_password) < 8:
+            return self._send_json(400, err("new_password must be at least 8 characters"))
+        ok = password_reset_consume(token, new_password)
+        if not ok:
+            return self._send_json(400, err("invalid, expired, or already-used token"))
+        return self._send_json(200, {"ok": True, "message": "password updated; all sessions revoked"})
 
     def _handle_workspace_create(self, row: sqlite3.Row) -> None:
         try:
@@ -1584,6 +1756,17 @@ class AgentChatHandler(http.server.BaseHTTPRequestHandler):
         return self._send_json(201, {"workspace": ws})
 
     def _auth(self) -> Optional[sqlite3.Row]:
+        # v0.3: cookie session takes precedence (works for SSE / EventSource
+        # which can't set custom headers). Falls back to Authorization: Bearer.
+        cookie_header = self.headers.get("Cookie", "")
+        if cookie_header:
+            for part in cookie_header.split(";"):
+                k, _, v = part.strip().partition("=")
+                if k == "agentchat_session" and v:
+                    row = token_lookup(v)
+                    if row:
+                        return row
+
         header = self.headers.get("Authorization", "")
         if not header.startswith("Bearer "):
             return None
@@ -1999,6 +2182,10 @@ class AgentChatHandler(http.server.BaseHTTPRequestHandler):
             return self._handle_auth_refresh()
         if path == "/v1/auth/logout":
             return self._handle_auth_logout()
+        if path == "/v1/auth/forgot":
+            return self._handle_auth_forgot()
+        if path == "/v1/auth/reset":
+            return self._handle_auth_reset()
         if path == "/v1/auth/whoami":
             row = self._auth()
             if not row:

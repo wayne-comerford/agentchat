@@ -1087,8 +1087,10 @@ const state = {
 };
 
 async function api(method, path, body, signal) {
+  // v0.3: no Authorization header — the browser auto-includes the
+  // agentchat_session cookie set by /v1/auth/login. Server-side _auth()
+  // reads the cookie first, falls back to Bearer for CLI clients.
   const headers = {
-    'Authorization': `Bearer ${state.identity.token}`,
     'Accept': 'application/json',
   };
   if (body !== undefined) headers['Content-Type'] = 'application/json';
@@ -1164,7 +1166,9 @@ async function doLogin() {
     if (!resp.ok) {
       return showLoginError(data.error || `Sign-in failed (HTTP ${resp.status}).`);
     }
-    state.identity = { name: username, token: data.token, workspace_id: data.workspace_id };
+    // v0.3: cookie session — token stays in HttpOnly cookie set by the server.
+// We only keep the username + workspace_id in JS state for display.
+    state.identity = { name: username, workspace_id: data.workspace_id };
 
     if ($('remember-me').checked) {
       localStorage.setItem('agentchat.identity', JSON.stringify({ username }));
@@ -1203,7 +1207,9 @@ async function doRegister() {
       return showRegisterError(data.error || `Registration failed (HTTP ${resp.status}).`);
     }
     // Auto sign-in after register
-    state.identity = { name: username, token: data.token, workspace_id: data.workspace_id };
+    // v0.3: cookie session — token stays in HttpOnly cookie set by the server.
+// We only keep the username + workspace_id in JS state for display.
+    state.identity = { name: username, workspace_id: data.workspace_id };
     $('register-view').classList.add('hidden');
     $('app-view').classList.remove('hidden');
     renderIdentity();
@@ -1326,7 +1332,8 @@ async function subscribeThreadEvents(threadId) {
       `/v1/threads/${encodeURIComponent(threadId)}/events?since=${since}`,
       {
         headers: {
-          'Authorization': `Bearer ${state.identity.token}`,
+          // v0.3: cookie-only auth — EventSource can't set custom headers,
+          // so the browser auto-includes agentchat_session for us.
           'Accept': 'text/event-stream',
         },
         signal: ac.signal,
