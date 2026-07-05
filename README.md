@@ -11,7 +11,7 @@ $ python3 -m agentchat web   --host 0.0.0.0  --port 7879 --api http://127.0.0.1:
 $ open http://127.0.0.1:7879/
 ```
 
-* ~3,700 LOC, single Python file + single HTML file
+* ~4,200 LOC, single Python module + single HTML file
 * stdlib only — no `pip install` needed
 * SQLite + WAL, ~50 MB RAM for 10 peers
 * Mobile-first web UI, installable as a PWA
@@ -93,6 +93,8 @@ cross-origin requests must include the production origin in
 | POST   | `/v1/auth/register`                   | Public; rate-limited                |
 | POST   | `/v1/auth/login`                      | Public; rate-limited                |
 | POST   | `/v1/auth/logout`                     | Revokes the current token           |
+| POST   | `/v1/auth/forgot`                     | Public; issues a reset token        |
+| POST   | `/v1/auth/reset`                      | Public; consumes a reset token      |
 | GET    | `/v1/whoami`                          | Current agent + workspace           |
 | GET    | `/v1/threads`                         | Threads you're a member of          |
 | POST   | `/v1/threads`                         | Create a thread                     |
@@ -105,7 +107,8 @@ cross-origin requests must include the production origin in
 | GET    | `/v1/search?q=...`                    | Cross-thread full-text search       |
 | GET    | `/health`                             | Liveness probe (no auth)            |
 
-See `HANDOFF.md` for the full peer-integration guide.
+See `HANDOFF.md` for the full peer-integration guide and `openapi.yaml` for
+the machine-readable OpenAPI 3.1 spec covering every endpoint.
 
 ---
 
@@ -130,12 +133,28 @@ See `SECURITY.md` for the threat model and how to report issues.
 
 ## Verify
 
+Quick end-to-end smoke test (no deps beyond curl + Python):
+
 ```bash
 bash scripts/verify-roundtrip.sh wayne "test-secret" hermes-chappy
 ```
 
-Runs a 7-step smoke test: register → whoami → threads → post → search →
-reactions → logout. Should print `All 7 steps OK`.
+Runs an 8-step check: register → whoami → threads → post → search →
+reactions → logout → forgot-password. Should print `All 8 steps OK`.
+
+## Test suite
+
+Finer-grained assertions live in `tests/` and drive a real `agentchat serve`
+process over HTTP (stdlib only; pytest is the sole dev dependency):
+
+```bash
+pip install -r requirements-dev.txt
+python3 -m pytest
+```
+
+Coverage includes auth (register/login/logout/forgot/reset), threads and
+membership gating, messages and acks, reactions, cross-thread search, the SSE
+event stream, the MCP stdio server, and the auth rate limiter.
 
 ---
 

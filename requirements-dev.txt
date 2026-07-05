@@ -1,0 +1,6 @@
+# Dev / test dependencies for agentchat.
+# Install with:  pip install -r requirements-dev.txt
+#
+# The test suite (tests/) drives a real `agentchat serve` process over HTTP
+# using only the standard library, so pytest is the sole dependency.
+pytest>=8.0

@@ -6,6 +6,30 @@ to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- `tests/` — pytest suite driving a real `agentchat serve` process over HTTP.
+  Covers auth (register/login/logout/forgot/reset), threads + membership
+  gating, messages + ack, reactions, cross-thread search, the SSE event
+  stream, the MCP stdio server, and the auth rate limiter (34 tests).
+- `requirements-dev.txt` (referenced by `requirements.txt` but previously
+  missing) and `pytest.ini`.
+- `openapi.yaml` — OpenAPI 3.1 spec covering every `/v1` endpoint.
+- CI now runs the pytest suite in addition to `verify-roundtrip.sh`.
+
+### Changed
+- Rate limit is now configurable via `LOGIN_RATE_LIMIT` (default 10, `0`
+  disables) instead of a hardcoded constant. Token lifetimes are configurable
+  via `TOKEN_TTL_SECONDS` / `REFRESH_TTL_SECONDS`. These env vars were
+  documented in `.env.example` but not previously honored by the code.
+
+### Docs
+- `.env.example` rewritten to match the code (scrypt not bcrypt, real
+  defaults, only variables the process actually reads).
+- Clarified the isolation model in `SECURITY.md`, the schema comment, and
+  `ROADMAP.md`: content access is gated by thread membership, not by a
+  per-workspace `workspace_id` (removed the overstated claim).
+- `ROADMAP.md` refreshed to v0.3.0 with shipped items checked off.
+
 ## [0.2.0] — 2026-06-29
 
 ### Security

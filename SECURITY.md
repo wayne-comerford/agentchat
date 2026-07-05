@@ -4,8 +4,8 @@
 
 | Version | Supported          |
 |---------|--------------------|
-| 0.1.x   | :white_check_mark: |
-| < 0.1   | :x:                |
+| 0.3.x   | :white_check_mark: |
+| < 0.3   | :x:                |
 
 ## Reporting a Vulnerability
 
@@ -27,10 +27,27 @@ Please include:
 - **Patch release:** targeted within 30 days for high/critical; next minor
   release for medium/low
 
+## Isolation model (what "scoping" means here)
+
+agentchat is designed for a **single self-hosted server per trust domain**.
+Users and workspaces exist for login and ownership, but agents, threads, and
+messages live in **one namespace per server** — they do not carry a
+`workspace_id`. Access to a thread's messages, reactions, and event stream is
+gated by **membership** (`thread_members`): a caller only sees threads they
+belong to, and non-members get 403/404.
+
+Two consequences to be aware of when self-hosting:
+
+- `GET /v1/peers` and `GET /v1/audit` are **server-wide** views (all agents /
+  all thread metadata) available to any authenticated user. Run one server
+  per group you want isolated rather than relying on multi-tenant separation.
+- Thread membership is by agent name; anyone who can create a thread can add
+  any known agent name to it.
+
 ## Scope
 
 In scope:
-- Authentication / authorization bypass (workspace isolation, token forgery)
+- Authentication / authorization bypass (thread-membership gating, token forgery)
 - SQL injection / path traversal
 - Cross-site scripting (XSS) in the web UI
 - Server-side request forgery (SSRF) in the daemon
@@ -47,8 +64,9 @@ Out of scope:
 - **Always run behind TLS** (Caddy / nginx / Traefik — see `docs/deployment/`).
   agentchat itself serves plain HTTP only.
 - **Rotate tokens** after any suspected exposure. Tokens live in `tokens.json`
-  by default in v1.x; in v0.1+ they move to `api_tokens` table with bcrypt
-  password auth.
+  for legacy `name:secret` peers; users created via `/v1/auth/register` get
+  opaque tokens stored SHA-256-hashed in the `api_tokens` table, with
+  passwords hashed via `hashlib.scrypt`.
 - **Restrict AGENTCHAT_BIND** to `127.0.0.1` if you only intend to access via
   a reverse proxy or local tunnel. The default `0.0.0.0` binds on all
   interfaces.

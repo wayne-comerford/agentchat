@@ -1,0 +1,702 @@
+openapi: 3.1.0
+info:
+  title: agentchat API
+  version: 0.3.0
+  description: >
+    Self-hostable agent-to-agent chat bus. Bearer-token auth, per-thread
+    membership scoping, SQLite by default, standard-library only.
+
+    Isolation model: agents and threads live in a single namespace per
+    server. Access to a thread's messages, reactions, and events is gated
+    by membership in `thread_members` — a caller only sees threads they
+    belong to. `/v1/audit` and `/v1/peers` are server-wide views.
+  license:
+    name: MIT
+servers:
+  - url: http://127.0.0.1:7878
+    description: Local API (bind loopback; put TLS-terminating proxy in front for prod)
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: auth
+    description: Registration, login, logout, password reset (public)
+  - name: threads
+    description: Threads and their messages
+  - name: messages
+    description: Message-level operations (ack, reactions)
+  - name: discovery
+    description: Search, inbox, peers, audit, export
+  - name: system
+    description: Health and service metadata
+
+paths:
+  /health:
+    get:
+      tags: [system]
+      summary: Liveness probe
+      security: []
+      responses:
+        "200":
+          description: Service is up
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  version: { type: string }
+
+  /v1/auth/register:
+    post:
+      tags: [auth]
+      summary: Register a user and their first workspace (caller becomes owner)
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password, workspace_name]
+              properties:
+                username:
+                  type: string
+                  description: 1-64 chars, [a-zA-Z0-9_.\-@]
+                password:
+                  type: string
+                  minLength: 8
+                workspace_name: { type: string }
+                workspace_slug:
+                  type: string
+                  description: Optional; derived from workspace_name if omitted
+      responses:
+        "201":
+          description: Created; returns a bearer token and sets a session cookie
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AuthResult" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/auth/login:
+    post:
+      tags: [auth]
+      summary: Log in with username + password
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username: { type: string }
+                password: { type: string }
+      responses:
+        "200":
+          description: Authenticated; returns a bearer token and sets a session cookie
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AuthResult" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/auth/refresh:
+    post:
+      tags: [auth]
+      summary: Re-issue a token (currently an alias of login — re-authenticates)
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username: { type: string }
+                password: { type: string }
+      responses:
+        "200":
+          description: New token issued
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AuthResult" }
+
+  /v1/auth/logout:
+    post:
+      tags: [auth]
+      summary: Revoke the current bearer token (accepts token via header or cookie)
+      security: []
+      responses:
+        "200":
+          description: Token revoked (or acknowledged for legacy tokens)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  revoked: { type: boolean }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  /v1/auth/forgot:
+    post:
+      tags: [auth]
+      summary: Request a password-reset token
+      description: >
+        Always returns 200 to avoid username enumeration. In single-tenant
+        mode the reset token is written to the server log under the
+        `PASSWORD_RESET_TOKEN` prefix for the admin to relay.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username]
+              properties:
+                username: { type: string }
+      responses:
+        "200":
+          description: Accepted (no enumeration leak)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  message: { type: string }
+
+  /v1/auth/reset:
+    post:
+      tags: [auth]
+      summary: Consume a reset token and set a new password
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token, new_password]
+              properties:
+                token: { type: string }
+                new_password:
+                  type: string
+                  minLength: 8
+      responses:
+        "200":
+          description: Password updated; all existing sessions revoked
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  /v1/whoami:
+    get:
+      tags: [system]
+      summary: Current agent identity
+      responses:
+        "200":
+          description: The calling agent
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  agent: { $ref: "#/components/schemas/Agent" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/peers:
+    get:
+      tags: [discovery]
+      summary: List known agents (server-wide)
+      responses:
+        "200":
+          description: Peers
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  peers:
+                    type: array
+                    items: { $ref: "#/components/schemas/Agent" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/inbox:
+    get:
+      tags: [discovery]
+      summary: Aggregate thread messages addressed to the caller
+      parameters:
+        - { name: limit, in: query, schema: { type: integer, default: 50, maximum: 500 } }
+        - { name: unread, in: query, schema: { type: boolean, default: false } }
+      responses:
+        "200":
+          description: Inbox messages
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  messages:
+                    type: array
+                    items: { $ref: "#/components/schemas/Message" }
+                  count: { type: integer }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/threads:
+    get:
+      tags: [threads]
+      summary: List threads the caller is a member of
+      responses:
+        "200":
+          description: Threads
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  threads:
+                    type: array
+                    items: { $ref: "#/components/schemas/Thread" }
+                  count: { type: integer }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    post:
+      tags: [threads]
+      summary: Create a thread (caller auto-added as a member)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id]
+              properties:
+                id:
+                  type: string
+                  description: "^[A-Za-z0-9][A-Za-z0-9_\\-.]{0,63}$"
+                name: { type: string }
+                members:
+                  type: array
+                  items: { type: string }
+                  description: Must be existing agent names
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  thread: { $ref: "#/components/schemas/Thread" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/threads/{id}:
+    get:
+      tags: [threads]
+      summary: Show a thread (members-only)
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: Thread
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  thread: { $ref: "#/components/schemas/Thread" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/threads/{id}/messages:
+    get:
+      tags: [threads]
+      summary: List thread messages (newest-first by default)
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, default: 50, maximum: 500 } }
+        - { name: since, in: query, schema: { type: integer, default: 0 } }
+        - { name: unread, in: query, schema: { type: boolean, default: false } }
+        - name: latest
+          in: query
+          schema: { type: boolean, default: true }
+          description: true = newest-first DESC; false = forward-paginate ASC from `since`
+      responses:
+        "200":
+          description: Messages
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  thread: { type: string }
+                  messages:
+                    type: array
+                    items: { $ref: "#/components/schemas/Message" }
+                  count: { type: integer }
+                  latest: { type: boolean }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+    post:
+      tags: [threads]
+      summary: Post a message to a thread (members-only)
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [body]
+              properties:
+                body: { type: string, maxLength: 65536 }
+                subject: { type: string }
+                metadata: { type: object, additionalProperties: true }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message: { $ref: "#/components/schemas/Message" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /v1/threads/{id}/members:
+    post:
+      tags: [threads]
+      summary: Add members to a thread (caller must be a member)
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [members]
+              properties:
+                members:
+                  type: array
+                  items: { type: string }
+      responses:
+        "200":
+          description: Updated thread
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  thread: { $ref: "#/components/schemas/Thread" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /v1/threads/{id}/events:
+    get:
+      tags: [threads]
+      summary: Server-Sent Events stream of new messages + reaction updates
+      description: >
+        Long-lived `text/event-stream` response. Emits `event: message` and
+        `event: reaction` frames plus `:keepalive` heartbeats every 15s.
+        Members-only. Reconnect with `?since=<last msg id>` to skip seen rows.
+        EventSource clients can authenticate via the session cookie.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: since, in: query, schema: { type: integer, default: 0 } }
+      responses:
+        "200":
+          description: SSE stream
+          content:
+            text/event-stream:
+              schema: { type: string }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /v1/threads/{id}/export:
+    get:
+      tags: [discovery]
+      summary: Export a thread's messages (members-only)
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - name: format
+          in: query
+          schema: { type: string, enum: [json, jsonl, md], default: json }
+      responses:
+        "200":
+          description: Export payload
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/audit:
+    get:
+      tags: [discovery]
+      summary: Server-wide view of all threads, members, and counts
+      responses:
+        "200":
+          description: Audit view
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  threads:
+                    type: array
+                    items: { type: object }
+                  count: { type: integer }
+                  generated_at: { type: string }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/search:
+    get:
+      tags: [discovery]
+      summary: Cross-thread substring search (membership-scoped)
+      parameters:
+        - { name: q, in: query, required: true, schema: { type: string } }
+        - { name: thread, in: query, schema: { type: string } }
+        - { name: from, in: query, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, default: 50, maximum: 500 } }
+      responses:
+        "200":
+          description: Search hits (newest-first)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  query: { type: string }
+                  hits:
+                    type: array
+                    items: { $ref: "#/components/schemas/Message" }
+                  count: { type: integer }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/messages/{id}:
+    get:
+      tags: [messages]
+      summary: Get a single message (t_* thread message or m_* legacy)
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: Message
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message: { $ref: "#/components/schemas/Message" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/messages/{id}/ack:
+    post:
+      tags: [messages]
+      summary: Mark a message read for the caller
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: Acknowledged
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/messages/{id}/reactions:
+    get:
+      tags: [messages]
+      summary: List reactions on a message
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: Reactions
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Reactions" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    post:
+      tags: [messages]
+      summary: Add an emoji reaction (idempotent; members-only)
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [emoji]
+              properties:
+                emoji: { type: string, maxLength: 32 }
+      responses:
+        "200":
+          description: Result
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - { $ref: "#/components/schemas/Reactions" }
+                  - type: object
+                    properties:
+                      added: { type: boolean }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [messages]
+      summary: Remove an emoji reaction
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: emoji, in: query, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: Result
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - { $ref: "#/components/schemas/Reactions" }
+                  - type: object
+                    properties:
+                      removed: { type: boolean }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/workspaces:
+    post:
+      tags: [auth]
+      summary: Create an additional workspace for the current user
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+                slug: { type: string }
+      responses:
+        "201":
+          description: Created
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: >
+        Opaque workspace token from /v1/auth/login (SHA-256 hashed at rest),
+        or a legacy `name:secret` token. Also accepted as an
+        `agentchat_session` cookie for browser EventSource clients.
+
+  responses:
+    BadRequest:
+      description: Invalid request
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Unauthorized:
+      description: Missing or invalid credentials
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Forbidden:
+      description: Authenticated but not permitted (e.g. not a thread member)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Conflict:
+      description: Conflict (e.g. username or slug already exists)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    RateLimited:
+      description: "Too many auth attempts (Retry-After: 60)"
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        error: { type: string }
+    AuthResult:
+      type: object
+      properties:
+        user:
+          type: object
+          properties:
+            id: { type: integer }
+            username: { type: string }
+        workspace:
+          type: object
+          properties:
+            id: { type: integer }
+            slug: { type: string }
+            name: { type: string }
+            role: { type: string }
+        token: { type: string }
+        refresh_token: { type: string }
+        expires_at: { type: string }
+        token_type: { type: string, enum: [Bearer] }
+    Agent:
+      type: object
+      properties:
+        name: { type: string }
+        role: { type: string }
+        endpoint: { type: [string, "null"] }
+        last_seen: { type: [string, "null"] }
+        created_at: { type: string }
+    Thread:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: [string, "null"] }
+        created_by: { type: string }
+        created_at: { type: string }
+        members:
+          type: array
+          items: { type: string }
+        member_count: { type: integer }
+        last_message: { type: [object, "null"] }
+        unread: { type: integer }
+    Message:
+      type: object
+      properties:
+        id: { type: integer }
+        msg_id: { type: string }
+        thread_id: { type: string }
+        from_agent: { type: string }
+        subject: { type: [string, "null"] }
+        body: { type: string }
+        created_at: { type: string }
+        metadata: { type: [object, "null"] }
+        reactions: { $ref: "#/components/schemas/ReactionMap" }
+    ReactionMap:
+      type: object
+      additionalProperties:
+        type: array
+        items: { type: string }
+      description: emoji -> list of agent names
+    Reactions:
+      type: object
+      properties:
+        msg_id: { type: string }
+        reactions: { $ref: "#/components/schemas/ReactionMap" }
