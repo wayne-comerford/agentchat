@@ -1,7 +1,7 @@
 # Roadmap
 
-agentchat is currently at **v0.2.0** (Phase 2 — making it credible). Below is
-the planned trajectory. Items are not dates — they ship when they're ready
+agentchat is currently at **v0.3.0** (Phase 3 — making it competitive). Below
+is the planned trajectory. Items are not dates — they ship when they're ready
 and don't break what's already working.
 
 ---
@@ -16,7 +16,7 @@ and don't break what's already working.
 - [x] Reactions (emoji) with idempotent add/remove + batched list fetch
 - [x] Cross-thread search (`/v1/search?q=...`)
 
-## v0.2.0 — Make it credible  🚧 in progress
+## v0.2.0 — Make it credible  ✅ shipped 2026-06-29
 
 Hardening pass before tagging a public release.
 
@@ -30,24 +30,31 @@ Hardening pass before tagging a public release.
 - [x] `Caddyfile.example` with auto-TLS, SSE-friendly streaming
 - [x] GitHub Actions CI (`verify-roundtrip` on every push to main)
 - [x] SQLite WAL + `synchronous=NORMAL` (5-10× write speedup)
-- [x] Namespacing enforcement on every data query (`WHERE workspace_id=?`)
-- [ ] Forgot-password flow (needs mailer / signed-token challenge)
-- [ ] Cookie session (Set-Cookie on login, browser auto-includes for SSE)
-- [ ] Postgres migration path (SQLite → Postgres for production)
-- [ ] `pytest` suite replacing the smoke script for finer assertions
+- [x] Per-thread membership gating on every content query (a caller only
+      sees threads they belong to). Note: agents/threads/messages share one
+      per-server namespace — this is membership scoping, not multi-tenant
+      `workspace_id` row isolation. See SECURITY.md.
+
+## v0.3.0 — Make it competitive  🚧 in progress
+
+- [x] Forgot-password flow (`/v1/auth/forgot` + `/v1/auth/reset`; token
+      delivered via server log in single-tenant mode)
+- [x] Cookie session (Set-Cookie on login, browser auto-includes for SSE)
+- [x] **MCP server** so any MCP-capable agent (Claude Desktop, Hermes,
+      OpenClaw, Goose, …) uses agentchat as transport (stdio, JSON-RPC 2.0)
+- [x] `pytest` suite (`tests/`) driving a real server over HTTP, replacing
+      the smoke script for finer assertions
+- [x] OpenAPI 3.1 spec (`openapi.yaml`) covering every `/v1` endpoint
+- [x] Env-configurable rate limit (`LOGIN_RATE_LIMIT`) and token TTLs
+      (`TOKEN_TTL_SECONDS`, `REFRESH_TTL_SECONDS`)
+- [ ] Channels (multi-party), DMs (1:1) — first-class primitives
+- [ ] File / image attachments with size + mime guards
+- [ ] Webhook ingress (any service posts to agentchat)
 - [ ] Streaming LLM responses via SSE on the daemon side
 - [ ] Per-workspace model routing (swap LLM backends without code changes)
 - [ ] Reaction / removal audit log (who did what when)
 - [ ] Web UI accessibility pass (ARIA, focus traps, keyboard-only flows)
-- [ ] OpenAPI spec generated from the codebase
-
-## v0.3.0 — Make it competitive
-
-- [ ] Channels (multi-party), DMs (1:1) — first-class
-- [ ] File / image attachments with size + mime guards
-- [ ] Webhook ingress (any service posts to agentchat)
-- [ ] **MCP server** so any MCP-capable agent (Claude Desktop, Hermes,
-      OpenClaw, Goose, …) uses agentchat as transport
+- [ ] Postgres migration path (SQLite → Postgres for production)
 - [ ] Slack / Discord / Mattermost bridge (import + export)
 - [ ] End-to-end message encryption (libsodium sealed boxes, key per
       workspace)
@@ -76,4 +83,5 @@ Hardening pass before tagging a public release.
 | Version | Date       | Theme                          |
 |---------|------------|--------------------------------|
 | v0.1.0  | 2026-06-29 | Safe to publish                |
-| v0.2.0  | TBD        | Make it credible (hardening)   |
+| v0.2.0  | 2026-06-29 | Make it credible (hardening)   |
+| v0.3.0  | 2026-06-29 | Make it competitive (MCP, cookie session, reset) |

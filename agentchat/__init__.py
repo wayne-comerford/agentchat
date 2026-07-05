@@ -96,15 +96,18 @@ def hash_token(token: str) -> str:
 # =====================================================================
 
 # In-memory rate limiter for /v1/auth/* endpoints. Sliding 60-second window
-# keyed by remote IP. Cap = 10 attempts/min/IP — generous for humans, tight
-# enough to stop brute force. Resets when daemon restarts (acceptable).
+# keyed by remote IP. Cap defaults to 10 attempts/min/IP — generous for
+# humans, tight enough to stop brute force. Override with the
+# LOGIN_RATE_LIMIT env var (0 = disabled). Resets when daemon restarts.
 _RATELIMIT_BUCKET: dict[str, list[float]] = {}
-_RATELIMIT_MAX = 10        # max requests per window
+_RATELIMIT_MAX = int(os.environ.get("LOGIN_RATE_LIMIT", "10"))  # max req/window
 _RATELIMIT_WINDOW = 60.0    # seconds
 
 
 def _ratelimit_check(ip: str) -> bool:
     """Return True if request is allowed, False if rate-limited."""
+    if _RATELIMIT_MAX <= 0:
+        return True  # limiter disabled
     import time as _t
     now = _t.monotonic()
     bucket = _RATELIMIT_BUCKET.get(ip, [])
@@ -205,8 +208,10 @@ CREATE TABLE IF NOT EXISTS thread_members (
 CREATE INDEX IF NOT EXISTS idx_member ON thread_members(agent_name);
 
 -- v0.1.0 auth tables (Phase 1, real auth)
--- users hold bcrypt/scrypt-hashed passwords. workspace scoping is
--- enforced on every API call by joining through api_tokens.
+-- users hold scrypt-hashed passwords; api_tokens carry the (user, workspace)
+-- context a bearer token was issued for. NOTE: agents/threads/messages are a
+-- single per-server namespace — access to thread content is gated by
+-- thread_members (membership), not by workspace_id. See SECURITY.md.
 CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     username TEXT UNIQUE NOT NULL,
@@ -403,9 +408,9 @@ _SCRYPT_R = 8
 _SCRYPT_P = 1
 _SCRYPT_DKLEN = 64
 
-# Token TTLs
-_TOKEN_TTL_SECONDS = 60 * 60 * 24        # 24 hours
-_REFRESH_TTL_SECONDS = 60 * 60 * 24 * 30  # 30 days
+# Token TTLs (override with TOKEN_TTL_SECONDS / REFRESH_TTL_SECONDS env vars)
+_TOKEN_TTL_SECONDS = int(os.environ.get("TOKEN_TTL_SECONDS", str(60 * 60 * 24)))  # 24h
+_REFRESH_TTL_SECONDS = int(os.environ.get("REFRESH_TTL_SECONDS", str(60 * 60 * 24 * 30)))  # 30d
 
 
 def _hash_password(password: str) -> str:
