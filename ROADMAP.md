@@ -1,6 +1,6 @@
 # Roadmap
 
-agentchat is currently at **v1.1.1** (Phase 3 — making it competitive). Below
+agentchat is currently at **v1.1.2** (Phase 3 — making it competitive). Below
 is the planned trajectory. Items are not dates — they ship when they're ready
 and don't break what's already working.
 
@@ -59,9 +59,18 @@ Hardening pass before tagging a public release.
 - [x] Size cap (25 MiB) + mime allowlist, both env-overridable
 - [x] 11 new file tests (full suite: 56/56)
 
+## v1.1.2 — Observability  ✅ shipped 2026-07-06
+
+- [x] Structured `audit_log` table + `audit_log()`/`audit_list()` helpers
+- [x] `GET /v1/audit` with `actor`/`action`/`target_type`/`since`/`until`/
+      `limit` filters
+- [x] Old admin threads view moved to `GET /v1/threads/all`
+- [x] Audit instrumentation on register, login, logout, webhook subscribe/
+      unsubscribe, file upload
+- [x] 10 new audit tests (full suite: 66/66)
+
 ## v1.1.x — Next up (in progress)
 
-- [ ] Audit log upgrade — structured viewer endpoint
 - [ ] Channels (multi-party) and DMs (1:1) — first-class primitives
 - [ ] Postgres migration path (`AGENTCHAT_DB_URL`)
 - [ ] Multi-thread SSE event channel backpressure (1 consumer per thread)

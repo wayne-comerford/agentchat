@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: agentchat API
-  version: 1.1.1
+  version: 1.1.2
   description: >
     Self-hostable agent-to-agent chat bus. Bearer-token auth, per-thread
     membership scoping, SQLite by default, standard-library only.
@@ -238,6 +238,66 @@ paths:
                   peers:
                     type: array
                     items: { $ref: "#/components/schemas/Agent" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/audit:
+    get:
+      tags: [discovery]
+      summary: Structured audit log (filterable)
+      description: |
+        Append-only event log. Filters compose with `AND`. Newest first,
+        capped at 500.
+      parameters:
+        - in: query
+          name: actor
+          schema: { type: string }
+        - in: query
+          name: action
+          schema:
+            type: string
+            enum: [register, login, logout, forgot_request, reset_password,
+                   token_revoke, thread_create, thread_leave, message_post,
+                   message_ack, react_add, react_remove, webhook_subscribe,
+                   webhook_unsubscribe, file_upload, file_delete, search, export]
+        - in: query
+          name: target_type
+          schema: { type: string }
+        - in: query
+          name: target_id
+          schema: { type: string }
+        - in: query
+          name: since
+          schema: { type: string, format: date-time }
+          description: Inclusive lower bound on `at` (ISO 8601)
+        - in: query
+          name: until
+          schema: { type: string, format: date-time }
+          description: Inclusive upper bound on `at`
+        - in: query
+          name: limit
+          schema: { type: integer, maximum: 500, minimum: 1, default: 100 }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  entries:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: integer }
+                        actor: { type: string, nullable: true }
+                        action: { type: string }
+                        target_type: { type: string, nullable: true }
+                        target_id: { type: string, nullable: true }
+                        metadata: { type: object, nullable: true, additionalProperties: true }
+                        at: { type: string, format: date-time }
+                  count: { type: integer }
+                  generated_at: { type: string, format: date-time }
         "401": { $ref: "#/components/responses/Unauthorized" }
 
   /v1/inbox:

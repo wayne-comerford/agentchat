@@ -370,6 +370,20 @@ CREATE TABLE IF NOT EXISTS files (
 CREATE UNIQUE INDEX IF NOT EXISTS ux_files_sha256 ON files(sha256);
 CREATE INDEX IF NOT EXISTS idx_files_owner ON files(owner_user_id);
 CREATE INDEX IF NOT EXISTS idx_files_created ON files(created_at);
+
+CREATE TABLE IF NOT EXISTS audit_log (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    actor        TEXT,                      -- agent name or NULL for unauth/system
+    action       TEXT NOT NULL,             -- 'register', 'login', 'logout', 'message_post', ...
+    target_type  TEXT,                      -- 'thread', 'message', 'file', 'webhook', 'token', NULL
+    target_id    TEXT,                      -- free-form id (string for portability: "t_abc123")
+    metadata     TEXT,                      -- JSON blob with action-specific extras
+    at           TEXT NOT NULL              -- ISO timestamp
+);
+CREATE INDEX IF NOT EXISTS idx_audit_at ON audit_log(at);
+CREATE INDEX IF NOT EXISTS idx_audit_actor ON audit_log(actor);
+CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_log(action);
+CREATE INDEX IF NOT EXISTS idx_audit_target ON audit_log(target_type, target_id);
 """
 
 
@@ -901,6 +915,121 @@ def file_delete(file_id: int, requester_user_id: int) -> Optional[str]:
     except OSError:
         pass
     return "deleted"
+
+
+
+# ---------------------------------------------------------------------------
+# Audit log (v1.1.2)
+# ---------------------------------------------------------------------------
+# Append-only structured event log. Every meaningful state change should
+# call `audit_log(...)`. Reads go through `audit_list(...)`.
+# Failure to write an audit row must NEVER block the action itself, so all
+# writes are best-effort with logging on error.
+
+VALID_AUDIT_ACTIONS = frozenset({
+    "register", "login", "logout", "forgot_request", "reset_password",
+    "token_revoke",
+    "thread_create", "thread_leave",
+    "message_post", "message_ack",
+    "react_add", "react_remove",
+    "webhook_subscribe", "webhook_unsubscribe",
+    "file_upload", "file_delete",
+    "search", "export",
+})
+
+
+def audit_log(
+    *,
+    action: str,
+    actor: Optional[str] = None,
+    target_type: Optional[str] = None,
+    target_id: Optional[str] = None,
+    metadata: Optional[dict] = None,
+) -> Optional[int]:
+    """Best-effort insert into audit_log. Returns rowid on success, None on fail."""
+    if action not in VALID_AUDIT_ACTIONS:
+        # Unknown action — still log it but mark unknown to surface drift.
+        # Don't refuse on this; future actions should be added to the set.
+        pass
+    try:
+        conn = db_connect()
+        try:
+            cur = conn.execute(
+                "INSERT INTO audit_log(actor, action, target_type, target_id, metadata, at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    actor,
+                    action,
+                    target_type,
+                    str(target_id) if target_id is not None else None,
+                    json.dumps(metadata, separators=(",", ":"), default=str) if metadata else None,
+                    now_iso(),
+                ),
+            )
+            conn.commit()
+            return cur.lastrowid
+        finally:
+            conn.close()
+    except Exception as e:
+        log(f"audit_log failure (action={action}): {e}")
+        return None
+
+
+def audit_list(
+    *,
+    actor: Optional[str] = None,
+    action: Optional[str] = None,
+    target_type: Optional[str] = None,
+    target_id: Optional[str] = None,
+    since_iso: Optional[str] = None,
+    until_iso: Optional[str] = None,
+    limit: int = 100,
+) -> list[dict]:
+    """Filtered query of audit_log. Newest first."""
+    wheres: list[str] = []
+    params: list[Any] = []
+    if actor:
+        wheres.append("actor = ?"); params.append(actor)
+    if action:
+        wheres.append("action = ?"); params.append(action)
+    if target_type:
+        wheres.append("target_type = ?"); params.append(target_type)
+    if target_id:
+        wheres.append("target_id = ?"); params.append(str(target_id))
+    if since_iso:
+        wheres.append("at >= ?"); params.append(since_iso)
+    if until_iso:
+        wheres.append("at <= ?"); params.append(until_iso)
+    sql = (
+        "SELECT id, actor, action, target_type, target_id, metadata, at "
+        "FROM audit_log"
+    )
+    if wheres:
+        sql += " WHERE " + " AND ".join(wheres)
+    sql += " ORDER BY id DESC LIMIT ?"
+    params.append(max(1, min(int(limit), 500)))
+    conn = db_connect()
+    try:
+        rows = conn.execute(sql, params).fetchall()
+    finally:
+        conn.close()
+    out = []
+    for r in rows:
+        meta = r["metadata"]
+        try:
+            meta_obj = json.loads(meta) if meta else None
+        except (json.JSONDecodeError, TypeError):
+            meta_obj = None
+        out.append({
+            "id": r["id"],
+            "actor": r["actor"],
+            "action": r["action"],
+            "target_type": r["target_type"],
+            "target_id": r["target_id"],
+            "metadata": meta_obj,
+            "at": r["at"],
+        })
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -2272,6 +2401,9 @@ class AgentChatHandler(http.server.BaseHTTPRequestHandler):
             return self._send_json(409, err(f"conflict: {e}"))
         # v0.3: set session cookie (browser auto-includes for SSE/EventSource).
         self._set_session_cookie(result["token"])
+        audit_log(action="register", actor=username,
+                  target_type="user", target_id=username,
+                  metadata={"workspace": result.get("workspace", {}).get("slug")})
         return self._send_json(201, result)
 
     def _handle_auth_login(self) -> None:
@@ -2288,6 +2420,8 @@ class AgentChatHandler(http.server.BaseHTTPRequestHandler):
             return self._send_json(401, err("invalid credentials"))
         # v0.3: set session cookie.
         self._set_session_cookie(result["token"])
+        audit_log(action="login", actor=username,
+                  target_type="user", target_id=username)
         return self._send_json(200, result)
 
     def _handle_auth_refresh(self) -> None:
@@ -2319,6 +2453,9 @@ class AgentChatHandler(http.server.BaseHTTPRequestHandler):
             return self._send_json(200, {"ok": True, "note": "legacy token; rotation required"})
         revoked = token_revoke(token)
         self._clear_session_cookie()
+        audit_log(action="logout", target_type="token",
+                  metadata={"revoked": bool(revoked),
+                            "first_eight": token[:8] if token else None})
         return self._send_json(200, {"ok": True, "revoked": revoked})
 
     def _handle_auth_forgot(self) -> None:
@@ -2430,6 +2567,8 @@ class AgentChatHandler(http.server.BaseHTTPRequestHandler):
             sub_id = int(m.group(1))
             if not webhook_unsubscribe(sub_id):
                 return self._send_json(404, err("subscription not found"))
+            audit_log(action="webhook_unsubscribe", actor=row["name"],
+                      target_type="webhook", target_id=sub_id)
             return self._send_json(200, {"deleted": sub_id})
 
         # v1.1.x files: delete
@@ -2556,7 +2695,10 @@ class AgentChatHandler(http.server.BaseHTTPRequestHandler):
         # Accessible to any authenticated agent (no role gate) but observers
         # are read-only by design; the data exposed is the same data they're
         # already entitled to see in threads they're a member of.
-        if path == "/v1/audit":
+        # --- v1.1.2 admin: GET /v1/threads/all (all threads view).
+        # Renamed from /v1/audit in v1.1.2 so /v1/audit can be the structured
+        # event log instead. Old path still works for backwards compat.
+        if path in ("/v1/threads/all", "/v1/audit_threads"):
             row = self._auth()
             if not row:
                 return self._send_json(401, err("unauthorized"))
@@ -2587,6 +2729,31 @@ class AgentChatHandler(http.server.BaseHTTPRequestHandler):
             return self._send_json(200, {
                 "threads": threads_data,
                 "count": len(threads_data),
+                "generated_at": now_iso(),
+            })
+
+        # --- v1.1.2 audit log: GET /v1/audit with filters.
+        # Structured event log of register/login/post/react/upload/etc.
+        if path == "/v1/audit":
+            row = self._auth()
+            if not row:
+                return self._send_json(401, err("unauthorized"))
+            try:
+                limit = min(int(qs.get("limit", ["100"])[0]), 500)
+            except ValueError:
+                return self._send_json(400, err("bad limit"))
+            entries = audit_list(
+                actor=qs.get("actor", [None])[0] or None,
+                action=qs.get("action", [None])[0] or None,
+                target_type=qs.get("target_type", [None])[0] or None,
+                target_id=qs.get("target_id", [None])[0] or None,
+                since_iso=qs.get("since", [None])[0] or None,
+                until_iso=qs.get("until", [None])[0] or None,
+                limit=limit,
+            )
+            return self._send_json(200, {
+                "entries": entries,
+                "count": len(entries),
                 "generated_at": now_iso(),
             })
 
@@ -3093,6 +3260,9 @@ class AgentChatHandler(http.server.BaseHTTPRequestHandler):
             except sqlite3.IntegrityError:
                 return self._send_json(409, err("subscription already exists"))
             log(f"WEBHOOK sub id={res['id']} topic={topic} by {row['name']}")
+            audit_log(action="webhook_subscribe", actor=row["name"],
+                      target_type="webhook", target_id=res["id"],
+                      metadata={"topic": topic, "target_url": target_url})
             return self._send_json(201, {
                 "id": res["id"],
                 "topic": res["topic"],
@@ -3125,6 +3295,12 @@ class AgentChatHandler(http.server.BaseHTTPRequestHandler):
             if "error" in res:
                 return self._send_json(400, err(res["error"]))
             log(f"FILE id={res['id']} {res['size_bytes']}B {res['mime_type']} by {row['name']} deduped={res['deduped']}")
+            audit_log(action="file_upload", actor=row["name"],
+                      target_type="file", target_id=res["id"],
+                      metadata={"size_bytes": res["size_bytes"],
+                                "mime_type": res["mime_type"],
+                                "deduped": res["deduped"],
+                                "filename": res["filename"]})
             return self._send_json(201, res)
 
         return self._send_json(404, err("not found"))

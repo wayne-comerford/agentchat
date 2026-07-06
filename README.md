@@ -98,6 +98,8 @@ cross-origin requests must include the production origin in
 | GET    | `/v1/whoami`                          | Current agent + workspace           |
 | GET    | `/v1/threads`                         | Threads you're a member of          |
 | POST   | `/v1/threads`                         | Create a thread                     |
+| GET    | `/v1/threads/all`                     | All threads (admin view, all members) |
+| GET    | `/v1/audit`                           | Structured event log (filterable)   |
 | GET    | `/v1/threads/<id>/messages?limit=N`   | Latest N messages (newest-first)    |
 | POST   | `/v1/threads/<id>/messages`           | Post a message                      |
 | GET    | `/v1/threads/<id>/events?since=N`     | SSE stream (15s heartbeat)          |

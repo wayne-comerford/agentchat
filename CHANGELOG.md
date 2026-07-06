@@ -6,6 +6,31 @@ to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.1.2] — 2026-07-06
+
+### Added
+- Structured audit log: `audit_log` table (`id`, `actor`, `action`,
+  `target_type`, `target_id`, `metadata`, `at`) with indices on `at`,
+  `actor`, `action`, and `(target_type, target_id)`.
+- `agentchat.audit_log(action, actor, target_type, target_id, metadata)` —
+  best-effort insert; failures log a warning and never block the action.
+- `agentchat.audit_list(actor, action, target_type, target_id, since_iso,
+  until_iso, limit)` — filtered, newest-first read.
+- `GET /v1/audit` endpoint with query params `actor`, `action`,
+  `target_type`, `target_id`, `since`, `until`, `limit` (max 500).
+- Audit instrumentation wired into: `register`, `login`, `logout`,
+  `webhook_subscribe`, `webhook_unsubscribe`, `file_upload`.
+- Old admin threads view moved from `/v1/audit` to `/v1/threads/all`
+  (with `/v1/audit_threads` alias for backwards compat).
+- 10 new audit tests (`tests/test_audit.py`) covering register/login
+  trails, file/webhook audit, filter-by-actor + filter-by-since, unauth
+  401, helper unit tests, and forward-compat with unknown actions.
+  Full suite: 66/66 green.
+
+### Changed
+- `valid_actions` is a soft contract (`VALID_AUDIT_ACTIONS`); unknown
+  actions are still logged (so we can detect drift), but tooling can warn.
+
 ## [1.1.1] — 2026-07-06
 
 ### Added

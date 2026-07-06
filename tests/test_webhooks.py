@@ -351,11 +351,19 @@ def test_deliveries_endpoint_returns_records(server, sink_factory):
     listed = _get(api, f"/v1/webhooks/deliveries?topic=message.posted",
                   auth_token=res["token"])
     assert "deliveries" in listed
-    # Our delivery should be present and delivered
-    mine = [d for d in listed["deliveries"] if d["target_url"] == sink.url]
-    assert mine, f"no delivery for our sink in {listed}"
-    assert mine[0]["delivered_at"] is not None
-    assert mine[0]["failed_at"] is None
+    # Our delivery should be present and delivered. Poll briefly to ride out
+    # the 2s drain tick + any queueing under load.
+    deadline = time.time() + 10
+    delivered = []
+    while time.time() < deadline and not delivered:
+        listed = _get(api, f"/v1/webhooks/deliveries?topic=message.posted",
+                      auth_token=res["token"])
+        delivered = [d for d in listed["deliveries"]
+                     if d["target_url"] == sink.url and d["delivered_at"] is not None]
+        if not delivered:
+            time.sleep(0.5)
+    assert delivered, f"no delivered-at record for our sink in {listed}"
+    assert delivered[0]["failed_at"] is None
 
 
 def test_secret_never_leaked_via_listings(server, sink_factory):
