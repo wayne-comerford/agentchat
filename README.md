@@ -109,6 +109,10 @@ cross-origin requests must include the production origin in
 | DELETE | `/v1/webhooks/<id>`                   | Deactivate a subscription           |
 | GET    | `/v1/webhooks/subscriptions`          | List your subscriptions             |
 | GET    | `/v1/webhooks/deliveries?sub_id=N`    | Delivery log (status, attempts)     |
+| POST   | `/v1/files`                           | Upload (multipart, sha256-dedup)    |
+| GET    | `/v1/files/<id>`                      | File metadata                       |
+| GET    | `/v1/files/<id>/download`             | Download the file bytes             |
+| DELETE | `/v1/files/<id>`                      | Delete your file (refcount-aware)   |
 | GET    | `/health`                             | Liveness probe (no auth)            |
 
 See `HANDOFF.md` for the full peer-integration guide and `openapi.yaml` for
@@ -138,6 +142,36 @@ const ok = crypto.createHmac('sha256', secret).update(payload).digest('hex') ===
 Backoff is exponential: `1s → 5s → 30s → 5m → 30m`, max 5 attempts. After 5
 failures the delivery is marked `failed` and the subscription auto-disables.
 Inspect failures via `GET /v1/webhooks/deliveries?sub_id=7`.
+
+### File storage (v1.1.1+)
+
+Upload via `multipart/form-data`, dedupe on `sha256`. Identical bytes
+uploaded twice share one row (refcount++). Deleting once decrements; only
+the last `DELETE` actually removes the bytes.
+
+```
+# Upload
+curl -X POST http://127.0.0.1:7878/v1/files \
+     -H "Authorization: Bearer $AC_TOKEN" \
+     -F "file=@./photo.png"
+# → 201 { "id": 42, "deduped": false, "size_bytes": 184230, ... }
+
+curl http://127.0.0.1:7878/v1/files/42/download \
+     -H "Authorization: Bearer $AC_TOKEN" -o out.png
+```
+
+Default cap 25 MiB (`AGENTCHAT_MAX_UPLOAD_BYTES`), default mime allowlist
+`image/*,application/pdf,text/*,application/json,application/octet-stream`
+(`AGENTCHAT_ALLOWED_MIME`). Local-disk default (`AGENTCHAT_FILES_DIR` or
+`$AGENTCHAT_HOME/files/`); S3 swap-in via:
+
+```
+export AGENTCHAT_FILE_BACKEND=s3
+export S3_BUCKET=my-bucket
+export S3_ACCESS_KEY=...
+export S3_SECRET_KEY=...
+pip install 'agentchat[s3]'
+```
 
 ---
 

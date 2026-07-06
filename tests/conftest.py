@@ -55,7 +55,7 @@ class Client:
             headers["Authorization"] = f"Bearer {tok}"
         req = urllib.request.Request(url, data=data, method=method, headers=headers)
         try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
+            with urllib.request.urlopen(req, timeout=30) as resp:
                 payload = resp.read()
                 status = resp.status
         except urllib.error.HTTPError as e:
@@ -75,11 +75,34 @@ class Client:
     def delete(self, path, **kw):
         return self.request("DELETE", path, **kw)
 
+    def upload(self, path, filename: str, mime: str, content: bytes, token=None):
+        """multipart/form-data POST with a single file part."""
+        boundary = "----pytest-upload-boundary-XYZ123"
+        body = (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+            f"Content-Type: {mime}\r\n\r\n"
+        ).encode("utf-8") + content + f"\r\n--{boundary}--\r\n".encode("utf-8")
+        url = self.base_url + path
+        tok = self.token if token is None else token
+        headers = {"Content-Type": f"multipart/form-data; boundary={boundary}"}
+        if tok:
+            headers["Authorization"] = f"Bearer {tok}"
+        req = urllib.request.Request(url, data=body, method="POST", headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                payload = resp.read()
+                status = resp.status
+        except urllib.error.HTTPError as e:
+            payload = e.read()
+            status = e.code
+        return status, (json.loads(payload) if payload else None)
 
-@pytest.fixture(scope="session")
-def server(tmp_path_factory):
-    """Launch a real agentchat server for the whole test session."""
-    home = tmp_path_factory.mktemp("agentchat-home")
+
+@pytest.fixture
+def server(tmp_path):
+    """Launch a real agentchat server for the test."""
+    home = tmp_path / "agentchat-home"
     port = _free_port()
     env = dict(os.environ)
     env["AGENTCHAT_HOME"] = str(home)

@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: agentchat API
-  version: 1.1.0
+  version: 1.1.1
   description: >
     Self-hostable agent-to-agent chat bus. Bearer-token auth, per-thread
     membership scoping, SQLite by default, standard-library only.
@@ -14,6 +14,10 @@ info:
     Webhooks (v1.1.0) let external systems subscribe to `thread_create`,
     `message_post`, and `react` events with HMAC-signed HTTP callbacks,
     with exponential backoff retries (1s/5s/30s/5m/30m, max 5).
+
+    File storage (v1.1.1) accepts multipart uploads with sha256-based
+    dedupe and refcount-aware deletion. Local disk by default, S3 swap-in
+    via `AGENTCHAT_FILE_BACKEND=s3`.
   license:
     name: MIT
 servers:
@@ -34,6 +38,8 @@ tags:
     description: Search, inbox, peers, audit, export
   - name: webhooks
     description: Webhook subscriptions and delivery log
+  - name: files
+    description: File storage (upload, download, dedupe, ownership)
   - name: system
     description: Health and service metadata
 
@@ -678,6 +684,105 @@ paths:
                         attempts: { type: integer }
                         last_attempt_at: { type: string, format: date-time, nullable: true }
                         response_code: { type: integer, nullable: true }
+
+  /v1/files:
+    post:
+      tags: [files]
+      summary: Upload a file (multipart/form-data)
+      description: |
+        Stores the file, deduplicating on sha256. Second upload of identical
+        bytes returns the same id with `deduped=true`. Default max size 25 MiB
+        (`AGENTCHAT_MAX_UPLOAD_BYTES`); default mime allowlist is
+        `image/*`, `application/pdf`, `text/*`, `application/json`,
+        `application/octet-stream` (`AGENTCHAT_ALLOWED_MIME`).
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file:
+                  type: string
+                  format: binary
+      responses:
+        "201":
+          description: Stored
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: integer }
+                  deduped: { type: boolean }
+                  size_bytes: { type: integer }
+                  mime_type: { type: string }
+                  filename: { type: string }
+                  ref_count: { type: integer }
+                  sha256: { type: string }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  /v1/files/{id}:
+    get:
+      tags: [files]
+      summary: File metadata
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: integer }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: integer }
+                  size_bytes: { type: integer }
+                  mime_type: { type: string }
+                  filename: { type: string }
+                  ref_count: { type: integer }
+                  sha256: { type: string }
+                  created_at: { type: string, format: date-time }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [files]
+      summary: Decrement refcount; wipe bytes+row when refcount hits 0
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: integer }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  result: { type: string, enum: [decremented, deleted] }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/files/{id}/download:
+    get:
+      tags: [files]
+      summary: Download the file bytes
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: integer }
+      responses:
+        "200":
+          description: Binary body
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        "404": { $ref: "#/components/responses/NotFound" }
 
   /v1/workspaces:
     post:

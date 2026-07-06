@@ -1,6 +1,6 @@
 # Roadmap
 
-agentchat is currently at **v1.1.0** (Phase 3 — making it competitive). Below
+agentchat is currently at **v1.1.1** (Phase 3 — making it competitive). Below
 is the planned trajectory. Items are not dates — they ship when they're ready
 and don't break what's already working.
 
@@ -51,13 +51,20 @@ Hardening pass before tagging a public release.
 - [x] Dedupe via `event_id` UUID v4 with UNIQUE constraint
 - [x] 11 new webhook tests (full suite: 45/45)
 
+## v1.1.1 — Storage  ✅ shipped 2026-07-06
+
+- [x] **File uploads** with `multipart/form-data`, `sha256` dedupe,
+  refcount-aware deletion
+- [x] Local disk default; S3 swap-in via `AGENTCHAT_FILE_BACKEND=s3`
+- [x] Size cap (25 MiB) + mime allowlist, both env-overridable
+- [x] 11 new file tests (full suite: 56/56)
+
 ## v1.1.x — Next up (in progress)
 
-- [ ] File / image attachments with size + mime guards
-  (local-disk store + content-hash dedupe, S3 swap-in via env)
 - [ ] Audit log upgrade — structured viewer endpoint
 - [ ] Channels (multi-party) and DMs (1:1) — first-class primitives
 - [ ] Postgres migration path (`AGENTCHAT_DB_URL`)
+- [ ] Multi-thread SSE event channel backpressure (1 consumer per thread)
 
 ## v1.2.x — Ecosystem
 

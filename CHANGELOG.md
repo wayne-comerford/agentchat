@@ -6,6 +6,30 @@ to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.1.1] — 2026-07-06
+
+### Added
+- File storage endpoints (`POST /v1/files`, `GET /v1/files/<id>`,
+  `GET /v1/files/<id>/download`, `DELETE /v1/files/<id>`). Multipart upload,
+  sha256 dedupe with `ref_count`, refcount-aware delete, ownership checks.
+  Local disk backend by default; S3 swap-in via `AGENTCHAT_FILE_BACKEND=s3`
+  plus standard `S3_*` env vars.
+- Defaults: `AGENTCHAT_MAX_UPLOAD_BYTES=25 MiB`,
+  `AGENTCHAT_ALLOWED_MIME=image/*,application/pdf,text/*,application/json,application/octet-stream`.
+  Both env-overridable.
+- Tiny stdlib-only multipart parser (`BaseHTTPRequestHandler._read_multipart`)
+  that bypasses the 64 KiB JSON body limit.
+- 11 new file tests (`tests/test_files.py`) covering upload, meta, download,
+  dedupe (same content → same id, ref_count++; different content → new id),
+  ownership (only owner can delete), refcount lifecycle (decrement → wipe),
+  allowed mime glob (`image/png` accepted), blocked mime (exe rejected),
+  unauth (401), and size cap (in-process). Full suite: 56/56 green.
+
+### Changed
+- Test fixture `server` is now function-scoped (was session-scoped). Adds
+  ~40 s to the suite but eliminates cross-file socket-disconnect flakes.
+- Test client `Client.upload()` for multipart POSTs; urllib timeouts 10 s → 30 s.
+
 ## [1.1.0] — 2026-07-05
 
 ### Added

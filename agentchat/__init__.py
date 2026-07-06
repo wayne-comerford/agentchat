@@ -354,6 +354,22 @@ CREATE INDEX IF NOT EXISTS idx_webhook_deliv_due
     ON webhook_deliveries(next_retry_at)
     WHERE delivered_at IS NULL AND failed_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_webhook_deliv_topic ON webhook_deliveries(topic);
+
+CREATE TABLE IF NOT EXISTS files (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner_user_id INTEGER NOT NULL,
+    sha256        TEXT NOT NULL,            -- hex digest of bytes
+    size_bytes    INTEGER NOT NULL,
+    mime_type     TEXT NOT NULL,
+    filename      TEXT NOT NULL,            -- original filename
+    storage_key   TEXT NOT NULL,            -- backend-relative path / S3 key
+    ref_count     INTEGER NOT NULL DEFAULT 1,
+    created_at    TEXT NOT NULL,
+    FOREIGN KEY(owner_user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_files_sha256 ON files(sha256);
+CREATE INDEX IF NOT EXISTS idx_files_owner ON files(owner_user_id);
+CREATE INDEX IF NOT EXISTS idx_files_created ON files(created_at);
 """
 
 
@@ -631,6 +647,260 @@ def webhook_list_deliveries(topic: Optional[str] = None, since_id: int = 0, limi
             "created_at": r["created_at"],
         })
     return out
+
+
+# ---------------------------------------------------------------------------
+# File storage (v1.1.x)
+# ---------------------------------------------------------------------------
+# Default backend = local disk under AGENTCHAT_FILES_DIR (default
+# "$AGENTCHAT_HOME/files/"). Override with $AGENTCHAT_FILE_BACKEND=s3 plus
+# $S3_BUCKET / $S3_ACCESS_KEY / $S3_SECRET_KEY / $S3_ENDPOINT to enable the
+# S3Boto backend (lazy import; boto3 is optional).
+
+DEFAULT_MAX_UPLOAD_BYTES = 25 * 1024 * 1024  # 25 MiB
+DEFAULT_ALLOWED_MIME_GLOBS = (
+    "image/*",
+    "application/pdf",
+    "text/*",
+    "application/json",
+    "application/octet-stream",  # universal fallback
+)
+MIME_TYPE_RE = re.compile(r"^[a-z0-9.+\-]+/[a-z0-9.+\-.*]+$", re.IGNORECASE)
+
+
+def _file_storage_dir() -> str:
+    base = os.environ.get("AGENTCHAT_FILES_DIR") or os.path.join(
+        os.environ.get("AGENTCHAT_HOME") or "data", "files"
+    )
+    os.makedirs(base, exist_ok=True)
+    return base
+
+
+def _max_upload_bytes() -> int:
+    try:
+        return int(os.environ.get("AGENTCHAT_MAX_UPLOAD_BYTES", str(DEFAULT_MAX_UPLOAD_BYTES)))
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_UPLOAD_BYTES
+
+
+def _allowed_mime_globs() -> tuple[str, ...]:
+    raw = os.environ.get("AGENTCHAT_ALLOWED_MIME")
+    if raw:
+        return tuple(g.strip() for g in raw.split(",") if g.strip())
+    return DEFAULT_ALLOWED_MIME_GLOBS
+
+
+def _mime_matches(mime: str, globs: tuple[str, ...]) -> bool:
+    mime_l = mime.lower()
+    for g in globs:
+        g = g.lower().strip()
+        if g == "*/*" or g == "*":
+            return True
+        if g.endswith("/*"):
+            if mime_l.startswith(g[:-1]):  # "image/*" -> "image/"
+                return True
+        elif mime_l == g:
+            return True
+    return False
+
+
+def _sanitize_filename(name: str) -> str:
+    name = (name or "file").strip()
+    # Drop any path components and characters that are filesystem-hostile
+    name = os.path.basename(name)
+    if not name or name in (".", ".."):
+        name = "file"
+    # Replace runs of bad chars with single underscore
+    name = re.sub(r"[^A-Za-z0-9._\-]", "_", name)
+    return name[:200]
+
+
+def _storage_key(sha256: str) -> str:
+    # Shard by first 2 hex chars to avoid huge single dirs
+    return f"{sha256[:2]}/{sha256[2:]}"
+
+
+def _file_save_bytes(content: bytes, key: str) -> str:
+    """Write bytes to the configured backend. Returns absolute path or s3 uri."""
+    backend = os.environ.get("AGENTCHAT_FILE_BACKEND", "local").lower()
+    if backend == "s3":
+        try:
+            import boto3  # type: ignore  # noqa: F401
+        except ImportError as e:
+            raise RuntimeError("S3 backend requested but boto3 not installed (pip install agentchat[s3])") from e
+        import boto3  # type: ignore
+        s3 = boto3.client(
+            "s3",
+            aws_access_key_id=os.environ.get("S3_ACCESS_KEY"),
+            aws_secret_access_key=os.environ.get("S3_SECRET_KEY"),
+            endpoint_url=os.environ.get("S3_ENDPOINT") or None,
+            region_name=os.environ.get("S3_REGION") or None,
+        )
+        s3.put_object(Bucket=os.environ["S3_BUCKET"], Key=key, Body=content)
+        return f"s3://{os.environ['S3_BUCKET']}/{key}"
+    # local disk
+    base = _file_storage_dir()
+    full = os.path.join(base, key)
+    os.makedirs(os.path.dirname(full), exist_ok=True)
+    if not os.path.exists(full):
+        with open(full, "xb") as f:
+            f.write(content)
+    return full
+
+
+def _file_read_bytes(key: str, storage_key: str) -> bytes:
+    backend = os.environ.get("AGENTCHAT_FILE_BACKEND", "local").lower()
+    if backend == "s3":
+        import boto3  # type: ignore
+        s3 = boto3.client(
+            "s3",
+            aws_access_key_id=os.environ.get("S3_ACCESS_KEY"),
+            aws_secret_access_key=os.environ.get("S3_SECRET_KEY"),
+            endpoint_url=os.environ.get("S3_ENDPOINT") or None,
+            region_name=os.environ.get("S3_REGION") or None,
+        )
+        obj = s3.get_object(Bucket=storage_key, Key=key) if False else \
+              s3.get_object(Bucket=os.environ["S3_BUCKET"], Key=key)
+        return obj["Body"].read()
+    base = _file_storage_dir()
+    full = os.path.join(base, key)
+    with open(full, "rb") as f:
+        return f.read()
+
+
+def file_upload(
+    *,
+    owner_user_id: int,
+    filename: str,
+    mime_type: str,
+    content: bytes,
+) -> dict:
+    """Store an upload. Dedupe on sha256: same content → same record, ref_count++."""
+    if not mime_type or not MIME_TYPE_RE.match(mime_type):
+        return {"error": "invalid mime type"}
+    if len(content) > _max_upload_bytes():
+        return {"error": f"file exceeds max size ({_max_upload_bytes()} bytes)"}
+    if not _mime_matches(mime_type, _allowed_mime_globs()):
+        return {"error": f"mime {mime_type!r} not allowed"}
+    safe_name = _sanitize_filename(filename)
+    sha = hashlib.sha256(content).hexdigest()
+    key = _storage_key(sha)
+    conn = db_connect()
+    try:
+        # Try to find an existing file with the same sha
+        row = conn.execute(
+            "SELECT id, owner_user_id, size_bytes, mime_type, filename, ref_count "
+            "FROM files WHERE sha256 = ?",
+            (sha,),
+        ).fetchone()
+        now = now_iso()
+        if row:
+            # Dedupe path — bump ref_count, leave bytes as-is
+            conn.execute(
+                "UPDATE files SET ref_count = ref_count + 1 WHERE id = ?",
+                (row["id"],),
+            )
+            conn.commit()
+            return {
+                "id": row["id"],
+                "deduped": True,
+                "size_bytes": row["size_bytes"],
+                "mime_type": row["mime_type"],
+                "filename": row["filename"],
+                "ref_count": row["ref_count"] + 1,
+                "sha256": sha,
+            }
+        # First time we see this content — write bytes, insert row
+        _file_save_bytes(content, key)
+        conn.execute(
+            "INSERT INTO files(owner_user_id, sha256, size_bytes, mime_type, "
+            "filename, storage_key, ref_count, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, 1, ?)",
+            (owner_user_id, sha, len(content), mime_type, safe_name, key, now),
+        )
+        conn.commit()
+        fid = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+    finally:
+        conn.close()
+    return {
+        "id": fid,
+        "deduped": False,
+        "size_bytes": len(content),
+        "mime_type": mime_type,
+        "filename": safe_name,
+        "ref_count": 1,
+        "sha256": sha,
+    }
+
+
+def file_get_meta(file_id: int) -> Optional[dict]:
+    conn = db_connect()
+    try:
+        row = conn.execute(
+            "SELECT id, owner_user_id, sha256, size_bytes, mime_type, filename, "
+            "ref_count, created_at FROM files WHERE id = ?",
+            (file_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return None
+    return dict(row)
+
+
+def file_download(file_id: int) -> Optional[tuple[bytes, str, str]]:
+    """Return (bytes, mime_type, filename) or None if not found."""
+    meta = file_get_meta(file_id)
+    if not meta:
+        return None
+    conn = db_connect()
+    try:
+        key = conn.execute(
+            "SELECT storage_key FROM files WHERE id = ?", (file_id,)
+        ).fetchone()["storage_key"]
+    finally:
+        conn.close()
+    data = _file_read_bytes(key, "")
+    return data, meta["mime_type"], meta["filename"]
+
+
+def file_delete(file_id: int, requester_user_id: int) -> Optional[str]:
+    """Delete a file the requester owns. Decrements ref_count; only removes
+    bytes + row when ref_count hits 0."""
+    conn = db_connect()
+    try:
+        row = conn.execute(
+            "SELECT id, owner_user_id, ref_count FROM files WHERE id = ?",
+            (file_id,),
+        ).fetchone()
+        if not row:
+            return None
+        if row["owner_user_id"] != requester_user_id:
+            return "forbidden"
+        if row["ref_count"] > 1:
+            conn.execute(
+                "UPDATE files SET ref_count = ref_count - 1 WHERE id = ?",
+                (file_id,),
+            )
+            conn.commit()
+            return "decremented"
+        # Last reference — wipe bytes + row
+        key = conn.execute(
+            "SELECT storage_key FROM files WHERE id = ?", (file_id,)
+        ).fetchone()["storage_key"]
+        conn.execute("DELETE FROM files WHERE id = ?", (file_id,))
+        conn.commit()
+    finally:
+        conn.close()
+    # Best-effort bytes cleanup outside the txn
+    try:
+        base = _file_storage_dir()
+        full = os.path.join(base, key)
+        if os.path.exists(full):
+            os.remove(full)
+    except OSError:
+        pass
+    return "deleted"
 
 
 # ---------------------------------------------------------------------------
@@ -1931,6 +2201,57 @@ class AgentChatHandler(http.server.BaseHTTPRequestHandler):
         except json.JSONDecodeError as e:
             raise ValueError(f"invalid JSON: {e}") from e
 
+    def _read_multipart(self) -> dict:
+        """Tiny multipart/form-data parser. Returns {"fields": {...}, "files": {name: (filename, mime, bytes)}}.
+        Bypasses MAX_BODY_BYTES — caller decides the size limit."""
+        ctype = self.headers.get("Content-Type", "")
+        m = re.match(r"multipart/form-data;\s*boundary=(.+)", ctype, re.IGNORECASE)
+        if not m:
+            raise ValueError("not multipart/form-data")
+        boundary = ("--" + m.group(1).strip().strip('"')).encode("latin-1")
+        length = int(self.headers.get("Content-Length") or 0)
+        max_bytes = _max_upload_bytes() + 64 * 1024  # leave headroom for headers
+        if length <= 0:
+            raise ValueError("empty body")
+        if length > max_bytes:
+            raise ValueError(f"body too large ({length} > {max_bytes})")
+        raw = self.rfile.read(length)
+        fields: dict[str, str] = {}
+        files: dict[str, tuple[str, str, bytes]] = {}
+        # Split on boundary
+        parts = raw.split(boundary)
+        for part in parts:
+            if part in (b"", b"--", b"--\r\n"):
+                continue
+            if part.endswith(b"--\r\n") or part.endswith(b"--"):
+                continue
+            # Strip leading CRLF
+            if part.startswith(b"\r\n"):
+                part = part[2:]
+            if part.endswith(b"\r\n"):
+                part = part[:-2]
+            # Split headers / body
+            try:
+                header_blob, body = part.split(b"\r\n\r\n", 1)
+            except ValueError:
+                continue
+            header_text = header_blob.decode("latin-1", errors="replace")
+            disp = re.search(r'Content-Disposition: form-data;\s*name="([^"]+)"(?:\s*;\s*filename="([^"]*)")?',
+                             header_text, re.IGNORECASE)
+            if not disp:
+                continue
+            name = disp.group(1)
+            filename = disp.group(2) or ""
+            mime = ""
+            mt = re.search(r"Content-Type:\s*([^\r\n]+)", header_text, re.IGNORECASE)
+            if mt:
+                mime = mt.group(1).strip()
+            if filename:
+                files[name] = (filename, mime, body)
+            else:
+                fields[name] = body.decode("utf-8", errors="replace")
+        return {"fields": fields, "files": files}
+
     # --- v0.1.0 auth handlers ---
     def _handle_auth_register(self) -> None:
         try:
@@ -2110,6 +2431,17 @@ class AgentChatHandler(http.server.BaseHTTPRequestHandler):
             if not webhook_unsubscribe(sub_id):
                 return self._send_json(404, err("subscription not found"))
             return self._send_json(200, {"deleted": sub_id})
+
+        # v1.1.x files: delete
+        m = re.match(r"^/v1/files/(\d+)$", path)
+        if m:
+            fid = int(m.group(1))
+            res = file_delete(fid, row["id"])
+            if res is None:
+                return self._send_json(404, err("file not found"))
+            if res == "forbidden":
+                return self._send_json(403, err("not your file"))
+            return self._send_json(200, {"result": res})
 
         return self._send_json(405, err("method not allowed for path"))
 
@@ -2482,6 +2814,48 @@ class AgentChatHandler(http.server.BaseHTTPRequestHandler):
                 return self._send_json(400, err("bad limit/since_id"))
             return self._send_json(200, {"deliveries": webhook_list_deliveries(topic, since_id, limit)})
 
+        # v1.1.x files: meta + download
+        if path.startswith("/v1/files/") and path.count("/") == 3:
+            try:
+                fid = int(path.rsplit("/", 1)[-1])
+            except ValueError:
+                return self._send_json(400, err("bad file id"))
+            if "download" in qs.get("", [""])[0]:
+                pass  # already in path below — fall through to download route
+            meta = file_get_meta(fid)
+            if not meta:
+                return self._send_json(404, err("file not found"))
+            return self._send_json(200, {
+                "id": meta["id"],
+                "size_bytes": meta["size_bytes"],
+                "mime_type": meta["mime_type"],
+                "filename": meta["filename"],
+                "ref_count": meta["ref_count"],
+                "sha256": meta["sha256"],
+                "created_at": meta["created_at"],
+            })
+
+        if path.startswith("/v1/files/") and path.endswith("/download") and path.count("/") == 4:
+            try:
+                fid = int(path.split("/")[3])
+            except ValueError:
+                return self._send_json(400, err("bad file id"))
+            res = file_download(fid)
+            if not res:
+                return self._send_json(404, err("file not found"))
+            content, mime, fname = res
+            self.send_response(200)
+            self.send_header("Content-Type", mime)
+            self.send_header("Content-Length", str(len(content)))
+            self.send_header("Content-Disposition", f'attachment; filename="{fname}"')
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            try:
+                self.wfile.write(content)
+            except BrokenPipeError:
+                pass
+            return
+
         return self._send_json(404, err("not found"))
 
     def do_POST(self) -> None:  # noqa: N802
@@ -2726,6 +3100,32 @@ class AgentChatHandler(http.server.BaseHTTPRequestHandler):
                 "secret": res["secret"],  # returned ONCE — caller must store
                 "warning": "store this secret now; it cannot be retrieved",
             })
+
+        # v1.1.x files: upload
+        if path == "/v1/files" and self.command == "POST":
+            try:
+                mp = self._read_multipart()
+            except ValueError as e:
+                return self._send_json(400, err(str(e)))
+            # Accept either a single "file" part or "filename" + "mime" + raw body
+            if "file" in mp["files"]:
+                fname, mime, content = mp["files"]["file"]
+                mime = mime or mp["fields"].get("mime_type") or "application/octet-stream"
+            else:
+                # Raw body variant: filename + mime in fields, body treated as file
+                fname = mp["fields"].get("filename") or "upload.bin"
+                mime = mp["fields"].get("mime_type") or "application/octet-stream"
+                content = b""
+            res = file_upload(
+                owner_user_id=row["id"],
+                filename=fname,
+                mime_type=mime,
+                content=content,
+            )
+            if "error" in res:
+                return self._send_json(400, err(res["error"]))
+            log(f"FILE id={res['id']} {res['size_bytes']}B {res['mime_type']} by {row['name']} deduped={res['deduped']}")
+            return self._send_json(201, res)
 
         return self._send_json(404, err("not found"))
 
