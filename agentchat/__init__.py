@@ -54,6 +54,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -311,6 +312,48 @@ CREATE TABLE IF NOT EXISTS message_reactions (
     PRIMARY KEY (msg_id, agent_name, emoji)
 );
 CREATE INDEX IF NOT EXISTS idx_reax_msg ON message_reactions(msg_id);
+
+-- v1.1 webhook subscriptions (one server = one namespace today; workspace_id
+-- is reserved for future multi-tenancy but kept at the single value 1 on writes).
+-- `secret` is the HMAC signing key stored plaintext because the daemon needs it
+-- at delivery time to compute fresh signatures per retry. The DB is chmod 600
+-- (same trust domain as users + tokens). `secret` is still returned to the
+-- caller ONCE and treated as unretrievable.
+CREATE TABLE IF NOT EXISTS webhook_subscriptions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace_id INTEGER NOT NULL,
+    topic TEXT NOT NULL,            -- e.g. 'thread.created', 'message.posted', 'reaction.added'
+    target_url TEXT NOT NULL,
+    secret TEXT NOT NULL,
+    secret_last4 TEXT NOT NULL,     -- for masked display (last 4 chars of secret)
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    UNIQUE(workspace_id, topic, target_url)
+);
+CREATE INDEX IF NOT EXISTS idx_webhook_sub_topic ON webhook_subscriptions(topic) WHERE enabled = 1;
+
+-- v1.1 webhook delivery queue. event_id is the dedupe key; one row per subscription × event.
+CREATE TABLE IF NOT EXISTS webhook_deliveries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    subscription_id INTEGER NOT NULL,
+    event_id TEXT NOT NULL UNIQUE,
+    topic TEXT NOT NULL,
+    target_url TEXT NOT NULL,
+    payload TEXT NOT NULL,                -- JSON body
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    next_retry_at TEXT,                   -- ISO timestamp; NULL = ready now
+    delivered_at TEXT,                    -- ISO timestamp; set on 2xx
+    failed_at TEXT,                       -- ISO timestamp; set after MAX_ATTEMPTS
+    last_status INTEGER,                  -- last HTTP status from target
+    last_error TEXT,                      -- last error string (HTTP body or exception)
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(subscription_id) REFERENCES webhook_subscriptions(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_webhook_deliv_due
+    ON webhook_deliveries(next_retry_at)
+    WHERE delivered_at IS NULL AND failed_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_webhook_deliv_topic ON webhook_deliveries(topic);
 """
 
 
@@ -335,6 +378,259 @@ def db_init() -> None:
         os.chmod(DB_PATH, 0o600)
     except OSError:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Webhooks (v1.1)
+# ---------------------------------------------------------------------------
+#
+# Webhook delivery is in-process: the HTTP serve loop ticks every
+# WEBHOOK_DRAIN_INTERVAL seconds and processes due delivery rows. stdlib only.
+# One server = one namespace today, so workspace_id is the fixed integer 1.
+
+WEBHOOK_DRAIN_INTERVAL = float(os.environ.get("WEBHOOK_DRAIN_INTERVAL", "2.0"))
+WEBHOOK_MAX_ATTEMPTS = int(os.environ.get("WEBHOOK_MAX_ATTEMPTS", "5"))
+WEBHOOK_HTTP_TIMEOUT = float(os.environ.get("WEBHOOK_HTTP_TIMEOUT", "10.0"))
+
+# Backoff schedule in seconds. Index = attempt_count for the next attempt.
+WEBHOOK_BACKOFF = [1, 5, 30, 300, 1800]  # 1s, 5s, 30s, 5m, 30m
+
+_VALID_WEBHOOK_TOPICS = frozenset({
+    "thread.created",
+    "message.posted",
+    "reaction.added",
+})
+
+
+def _webhook_sign(secret: str, body: bytes) -> str:
+    """Return hex HMAC-SHA256 of `body` keyed by `secret`."""
+    mac = hmac.new(secret.encode("utf-8"), body, hashlib.sha256)
+    return mac.hexdigest()
+
+
+def _webhook_new_secret() -> str:
+    """32-byte URL-safe random secret. Returned ONCE on subscribe; never stored plaintext."""
+    return secrets.token_urlsafe(32)
+
+
+def webhook_subscribe(topic: str, target_url: str, created_by: str) -> dict:
+    """Subscribe a target URL to a topic. Returns {id, secret}; secret shown once.
+
+    Raises ValueError for invalid topic or malformed URL. Raises sqlite3.IntegrityError on duplicate.
+    """
+    if topic not in _VALID_WEBHOOK_TOPICS:
+        raise ValueError(f"unknown topic {topic!r}; valid: {sorted(_VALID_WEBHOOK_TOPICS)}")
+    parsed = urllib.parse.urlparse(target_url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise ValueError(f"target_url must be http(s) URL, got {target_url!r}")
+    secret = _webhook_new_secret()
+    conn = db_connect()
+    try:
+        cur = conn.execute(
+            "INSERT INTO webhook_subscriptions(workspace_id, topic, target_url, secret, secret_last4, created_by, created_at) "
+            "VALUES (1, ?, ?, ?, ?, ?, ?)",
+            (topic, target_url, secret, secret[-4:], created_by, now_iso()),
+        )
+        sub_id = cur.lastrowid
+    finally:
+        conn.close()
+    return {"id": sub_id, "topic": topic, "target_url": target_url, "secret": secret}
+
+
+def webhook_list_subscriptions() -> list[dict]:
+    conn = db_connect()
+    try:
+        rows = conn.execute(
+            "SELECT id, topic, target_url, secret_last4, created_by, created_at, enabled "
+            "FROM webhook_subscriptions ORDER BY id"
+        ).fetchall()
+    finally:
+        conn.close()
+    out = []
+    for r in rows:
+        out.append({
+            "id": r["id"],
+            "topic": r["topic"],
+            "target_url": r["target_url"],
+            "secret_preview": "***" + (r["secret_last4"] or ""),
+            "created_by": r["created_by"],
+            "created_at": r["created_at"],
+            "enabled": bool(r["enabled"]),
+        })
+    return out
+
+
+def webhook_unsubscribe(sub_id: int) -> bool:
+    conn = db_connect()
+    try:
+        cur = conn.execute("DELETE FROM webhook_subscriptions WHERE id = ?", (sub_id,))
+    finally:
+        conn.close()
+    return cur.rowcount > 0
+
+
+def enqueue_webhook_event(topic: str, payload: dict) -> int:
+    """Fan `payload` out to every enabled subscription on `topic`. Returns rows enqueued."""
+    conn = db_connect()
+    try:
+        subs = conn.execute(
+            "SELECT id FROM webhook_subscriptions WHERE topic = ? AND enabled = 1",
+            (topic,),
+        ).fetchall()
+    finally:
+        conn.close()
+    if not subs:
+        return 0
+    body = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    conn = db_connect()
+    n = 0
+    try:
+        for s in subs:
+            event_id = str(uuid.uuid4())
+            try:
+                conn.execute(
+                    "INSERT INTO webhook_deliveries"
+                    "(subscription_id, event_id, topic, target_url, payload, created_at) "
+                    "SELECT id, ?, ?, target_url, ?, ? FROM webhook_subscriptions WHERE id = ?",
+                    (event_id, topic, body, now_iso(), s["id"]),
+                )
+                n += 1
+            except sqlite3.IntegrityError:
+                pass  # duplicate event_id, skip
+    finally:
+        conn.close()
+    return n
+
+
+def _webhook_deliver_one(delivery_row: sqlite3.Row, secret: str) -> None:
+    """Try to deliver a single row. Updates DB in place. Never raises."""
+    body = delivery_row["payload"]
+    if isinstance(body, str):
+        body_bytes = body.encode("utf-8")
+    else:
+        body_bytes = body
+    sig = _webhook_sign(secret, body_bytes)
+    req = urllib.request.Request(
+        delivery_row["target_url"],
+        data=body_bytes,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": f"agentchat-webhook/{SERVER_VERSION}",
+            "X-AgentChat-Event-Id": delivery_row["event_id"],
+            "X-AgentChat-Topic": delivery_row["topic"],
+            "X-AgentChat-Signature": f"sha256={sig}",
+        },
+    )
+    status = 0
+    err_msg = ""
+    try:
+        with urllib.request.urlopen(req, timeout=WEBHOOK_HTTP_TIMEOUT) as resp:
+            status = resp.status
+            # Drain small response so connection can close
+            resp.read(1024)
+        ok = 200 <= status < 300
+    except urllib.error.HTTPError as e:
+        status = e.code
+        try:
+            err_msg = (e.read(256) or b"").decode("utf-8", errors="replace")[:200]
+        except Exception:
+            err_msg = str(e)
+        ok = False
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        err_msg = f"{type(e).__name__}: {e}"
+        ok = False
+
+    conn = db_connect()
+    try:
+        if ok:
+            conn.execute(
+                "UPDATE webhook_deliveries SET delivered_at = ?, last_status = ? WHERE id = ?",
+                (now_iso(), status, delivery_row["id"]),
+            )
+            return
+        attempt = (delivery_row["attempt_count"] or 0) + 1
+        if attempt >= WEBHOOK_MAX_ATTEMPTS:
+            conn.execute(
+                "UPDATE webhook_deliveries "
+                "SET attempt_count = ?, failed_at = ?, last_status = ?, last_error = ? WHERE id = ?",
+                (attempt, now_iso(), status, err_msg[:500], delivery_row["id"]),
+            )
+            return
+        # Schedule next retry
+        backoff_idx = min(attempt - 1, len(WEBHOOK_BACKOFF) - 1)
+        delay = WEBHOOK_BACKOFF[backoff_idx]
+        next_retry = now_iso()  # base; we'll add delay
+        # Compute next_retry_at as ISO now + delay seconds
+        from datetime import datetime, timedelta, timezone
+        t = datetime.now(timezone.utc) + timedelta(seconds=delay)
+        next_retry = t.strftime("%Y-%m-%dT%H:%M:%SZ")
+        conn.execute(
+            "UPDATE webhook_deliveries "
+            "SET attempt_count = ?, next_retry_at = ?, last_status = ?, last_error = ? WHERE id = ?",
+            (attempt, next_retry, status, err_msg[:500], delivery_row["id"]),
+        )
+    finally:
+        conn.close()
+
+
+def webhook_drain_pending() -> int:
+    """Process due delivery rows. Returns count attempted this call."""
+    conn = db_connect()
+    try:
+        rows = conn.execute(
+            "SELECT d.id, d.event_id, d.topic, d.target_url, d.payload, d.attempt_count, "
+            "       s.secret "
+            "FROM webhook_deliveries d JOIN webhook_subscriptions s ON s.id = d.subscription_id "
+            "WHERE d.delivered_at IS NULL AND d.failed_at IS NULL "
+            "AND (d.next_retry_at IS NULL OR d.next_retry_at <= ?) "
+            "ORDER BY d.id LIMIT 100",
+            (now_iso(),),
+        ).fetchall()
+    finally:
+        conn.close()
+    n = 0
+    for r in rows:
+        try:
+            _webhook_deliver_one(r, secret=r["secret"])
+        except Exception as e:
+            log(f"webhook deliver error: {e}")
+        n += 1
+    return n
+
+
+def webhook_list_deliveries(topic: Optional[str] = None, since_id: int = 0, limit: int = 100) -> list[dict]:
+    conn = db_connect()
+    try:
+        sql = (
+            "SELECT id, event_id, topic, target_url, attempt_count, "
+            "       delivered_at, failed_at, last_status, last_error, created_at "
+            "FROM webhook_deliveries WHERE id > ?"
+        )
+        params: list[Any] = [since_id]
+        if topic:
+            sql += " AND topic = ?"
+            params.append(topic)
+        sql += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+        rows = conn.execute(sql, params).fetchall()
+    finally:
+        conn.close()
+    out = []
+    for r in rows:
+        out.append({
+            "id": r["id"],
+            "event_id": r["event_id"],
+            "topic": r["topic"],
+            "target_url": r["target_url"],
+            "attempt_count": r["attempt_count"],
+            "delivered_at": r["delivered_at"],
+            "failed_at": r["failed_at"],
+            "last_status": r["last_status"],
+            "last_error": r["last_error"],
+            "created_at": r["created_at"],
+        })
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1807,6 +2103,14 @@ class AgentChatHandler(http.server.BaseHTTPRequestHandler):
                 return self._send_json(404, err("message not found"))
             return self._send_json(200, res)
 
+        # v1.1 webhooks: unsubscribe
+        m = re.match(r"^/v1/webhooks/subscriptions/(\d+)$", path)
+        if m:
+            sub_id = int(m.group(1))
+            if not webhook_unsubscribe(sub_id):
+                return self._send_json(404, err("subscription not found"))
+            return self._send_json(200, {"deleted": sub_id})
+
         return self._send_json(405, err("method not allowed for path"))
 
 
@@ -1837,6 +2141,11 @@ class AgentChatHandler(http.server.BaseHTTPRequestHandler):
                     "POST /v1/messages/<msg_id>/ack",
                     "GET  /v1/audit",
                     "GET  /v1/threads/<id>/export?format=json|jsonl|md",
+                    # v1.1 webhooks
+                    "POST /v1/webhooks/subscribe",
+                    "GET  /v1/webhooks/subscriptions",
+                    "GET  /v1/webhooks/deliveries?topic=X&since_id=N&limit=M",
+                    "DELETE /v1/webhooks/subscriptions/<id>",
                     # legacy v0.1 pairwise (compat)
                     "GET  /v1/messages",
                     "POST /v1/messages",
@@ -2159,6 +2468,20 @@ class AgentChatHandler(http.server.BaseHTTPRequestHandler):
             msgs = message_inbox(row["name"], since, limit, unread)
             return self._send_json(200, {"messages": msgs, "count": len(msgs)})
 
+        # v1.1 webhooks: list subscriptions
+        if path == "/v1/webhooks/subscriptions":
+            return self._send_json(200, {"subscriptions": webhook_list_subscriptions()})
+
+        # v1.1 webhooks: list deliveries
+        if path == "/v1/webhooks/deliveries":
+            topic = qs.get("topic", [None])[0]
+            try:
+                since_id = int(qs.get("since_id", ["0"])[0])
+                limit = min(int(qs.get("limit", ["100"])[0]), 500)
+            except ValueError:
+                return self._send_json(400, err("bad limit/since_id"))
+            return self._send_json(200, {"deliveries": webhook_list_deliveries(topic, since_id, limit)})
+
         return self._send_json(404, err("not found"))
 
     def do_POST(self) -> None:  # noqa: N802
@@ -2244,6 +2567,12 @@ class AgentChatHandler(http.server.BaseHTTPRequestHandler):
                 return self._send_json(403, err("not a member of this thread"))
             except ValueError as e:
                 return self._send_json(400, err(str(e)))
+            enqueue_webhook_event("reaction.added", {
+                "msg_id": msg_id,
+                "by": row["name"],
+                "emoji": emoji,
+                "at": now_iso(),
+            })
             return self._send_json(200, res)
         if m and self.command == "DELETE":
             msg_id = m.group(1)
@@ -2285,6 +2614,13 @@ class AgentChatHandler(http.server.BaseHTTPRequestHandler):
             except ValueError as e:
                 return self._send_json(400, err(str(e)))
             log(f"THREAD {row['name']} created '{tid}' members={t['members']}")
+            enqueue_webhook_event("thread.created", {
+                "thread_id": tid,
+                "name": name,
+                "members": t["members"],
+                "created_by": row["name"],
+                "at": now_iso(),
+            })
             return self._send_json(201, {"thread": t})
 
         # post to thread
@@ -2306,6 +2642,14 @@ class AgentChatHandler(http.server.BaseHTTPRequestHandler):
             except PermissionError as e:
                 return self._send_json(403, err(str(e)))
             log(f"MSG {row['name']} -> {thread_id} ({msg.get('msg_id')})")
+            enqueue_webhook_event("message.posted", {
+                "thread_id": thread_id,
+                "msg_id": msg.get("msg_id"),
+                "from": row["name"],
+                "subject": subject,
+                "body_preview": body[:200],
+                "at": now_iso(),
+            })
             return self._send_json(201, {"message": msg})
 
         # add members
@@ -2348,7 +2692,40 @@ class AgentChatHandler(http.server.BaseHTTPRequestHandler):
                 metadata=data.get("metadata"),
             )
             log(f"MSG {row['name']} -> {to_agent} ({msg['msg_id']})")
+            enqueue_webhook_event("message.posted", {
+                "msg_id": msg["msg_id"],
+                "from": row["name"],
+                "to": to_agent,
+                "subject": subject,
+                "body_preview": body[:200],
+                "at": now_iso(),
+            })
             return self._send_json(201, {"message": msg})
+
+        # v1.1 webhooks: subscribe
+        if path == "/v1/webhooks/subscribe" and self.command == "POST":
+            try:
+                data = self._read_json()
+            except ValueError as e:
+                return self._send_json(400, err(str(e)))
+            topic = (data.get("topic") or "").strip()
+            target_url = (data.get("target_url") or "").strip()
+            if not topic or not target_url:
+                return self._send_json(400, err("fields 'topic' and 'target_url' required"))
+            try:
+                res = webhook_subscribe(topic, target_url, created_by=row["name"])
+            except ValueError as e:
+                return self._send_json(400, err(str(e)))
+            except sqlite3.IntegrityError:
+                return self._send_json(409, err("subscription already exists"))
+            log(f"WEBHOOK sub id={res['id']} topic={topic} by {row['name']}")
+            return self._send_json(201, {
+                "id": res["id"],
+                "topic": res["topic"],
+                "target_url": res["target_url"],
+                "secret": res["secret"],  # returned ONCE — caller must store
+                "warning": "store this secret now; it cannot be retrieved",
+            })
 
         return self._send_json(404, err("not found"))
 
@@ -2377,7 +2754,21 @@ def serve(host: str, port: int) -> None:
     signal.signal(signal.SIGTERM, _graceful_shutdown)
     signal.signal(signal.SIGINT, _graceful_shutdown)
 
-    log(f"agentchat server listening on http://{host}:{port} (v{SERVER_VERSION})")
+    # Background webhook drain: ticks every WEBHOOK_DRAIN_INTERVAL seconds and
+    # processes due deliveries. Lives in a daemon thread; v1.1 keeps it in-process.
+    def _webhook_loop():
+        while not _shutdown.is_set():
+            try:
+                webhook_drain_pending()
+            except Exception as e:
+                log(f"webhook drain tick error: {e}")
+            _shutdown.wait(WEBHOOK_DRAIN_INTERVAL)
+        log("webhook drain loop stopped")
+
+    _wh_thread = threading.Thread(target=_webhook_loop, name="webhook-drain", daemon=True)
+    _wh_thread.start()
+
+    log(f"agentchat server listening on http://{host}:{port} (v{SERVER_VERSION}) webhook_drain={WEBHOOK_DRAIN_INTERVAL}s")
     try:
         server.serve_forever()
     finally:

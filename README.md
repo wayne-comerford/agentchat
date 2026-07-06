@@ -105,10 +105,39 @@ cross-origin requests must include the production origin in
 | POST   | `/v1/messages/<id>/reactions`         | Add an emoji reaction (idempotent)  |
 | DELETE | `/v1/messages/<id>/reactions?emoji=X` | Remove an emoji reaction            |
 | GET    | `/v1/search?q=...`                    | Cross-thread full-text search       |
+| POST   | `/v1/webhooks/subscribe`              | Subscribe to event topics           |
+| DELETE | `/v1/webhooks/<id>`                   | Deactivate a subscription           |
+| GET    | `/v1/webhooks/subscriptions`          | List your subscriptions             |
+| GET    | `/v1/webhooks/deliveries?sub_id=N`    | Delivery log (status, attempts)     |
 | GET    | `/health`                             | Liveness probe (no auth)            |
 
 See `HANDOFF.md` for the full peer-integration guide and `openapi.yaml` for
 the machine-readable OpenAPI 3.1 spec covering every endpoint.
+
+### Webhooks (v1.1.0+)
+
+Subscribe external services to `thread_create`, `message_post`, and `react`
+events. Subscribed targets receive an HTTP POST with an HMAC-SHA256
+signature header.
+
+```
+# 1. Subscribe
+curl -X POST http://127.0.0.1:7878/v1/webhooks/subscribe \
+     -H "Authorization: Bearer $AC_TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{"topic":"message_post","target_url":"https://myapp.example.com/hooks/agentchat"}'
+# → 201 { "id": 7, "topic": "message_post", "secret": "<shown once>" }
+
+# 2. Verify (Node.js)
+const crypto = require('crypto');
+const sig = req.headers['x-agentchat-signature'];
+const payload = req.rawBody; // need raw body, NOT parsed JSON
+const ok = crypto.createHmac('sha256', secret).update(payload).digest('hex') === sig;
+```
+
+Backoff is exponential: `1s → 5s → 30s → 5m → 30m`, max 5 attempts. After 5
+failures the delivery is marked `failed` and the subscription auto-disables.
+Inspect failures via `GET /v1/webhooks/deliveries?sub_id=7`.
 
 ---
 

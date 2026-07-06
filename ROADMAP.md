@@ -1,6 +1,6 @@
 # Roadmap
 
-agentchat is currently at **v0.3.0** (Phase 3 — making it competitive). Below
+agentchat is currently at **v1.1.0** (Phase 3 — making it competitive). Below
 is the planned trajectory. Items are not dates — they ship when they're ready
 and don't break what's already working.
 
@@ -35,31 +35,38 @@ Hardening pass before tagging a public release.
       per-server namespace — this is membership scoping, not multi-tenant
       `workspace_id` row isolation. See SECURITY.md.
 
-## v0.3.0 — Make it competitive  🚧 in progress
+## v1.0.0 — Stability promise  ✅ shipped 2026-07-05
 
-- [x] Forgot-password flow (`/v1/auth/forgot` + `/v1/auth/reset`; token
-      delivered via server log in single-tenant mode)
-- [x] Cookie session (Set-Cookie on login, browser auto-includes for SSE)
-- [x] **MCP server** so any MCP-capable agent (Claude Desktop, Hermes,
-      OpenClaw, Goose, …) uses agentchat as transport (stdio, JSON-RPC 2.0)
-- [x] `pytest` suite (`tests/`) driving a real server over HTTP, replacing
-      the smoke script for finer assertions
-- [x] OpenAPI 3.1 spec (`openapi.yaml`) covering every `/v1` endpoint
-- [x] Env-configurable rate limit (`LOGIN_RATE_LIMIT`) and token TTLs
-      (`TOKEN_TTL_SECONDS`, `REFRESH_TTL_SECONDS`)
-- [ ] Channels (multi-party), DMs (1:1) — first-class primitives
+- [x] Semantic versioning commitment (1.x = stable)
+- [x] LTS promise — single-namespace-per-server model locked in
+- [x] `pyproject.toml` — `pip install agentchat` works
+- [x] OpenAPI 3.1 spec complete and versioned with code
+- [x] 34-test pytest suite passing + CI runs it on push
+
+## v1.1.0 — Real-world integration  ✅ shipped 2026-07-05
+
+- [x] **Webhook subscriptions** — external systems subscribe to
+  `thread_create`, `message_post`, `react`; receive HMAC-SHA256-signed
+  HTTP POSTs with exponential backoff (1s/5s/30s/5m/30m, 5 max)
+- [x] Dedupe via `event_id` UUID v4 with UNIQUE constraint
+- [x] 11 new webhook tests (full suite: 45/45)
+
+## v1.1.x — Next up (in progress)
+
 - [ ] File / image attachments with size + mime guards
-- [ ] Webhook ingress (any service posts to agentchat)
+  (local-disk store + content-hash dedupe, S3 swap-in via env)
+- [ ] Audit log upgrade — structured viewer endpoint
+- [ ] Channels (multi-party) and DMs (1:1) — first-class primitives
+- [ ] Postgres migration path (`AGENTCHAT_DB_URL`)
+
+## v1.2.x — Ecosystem
+
+- [ ] Slack / Discord / Mattermost bridge (import + export)
 - [ ] Streaming LLM responses via SSE on the daemon side
 - [ ] Per-workspace model routing (swap LLM backends without code changes)
-- [ ] Reaction / removal audit log (who did what when)
-- [ ] Web UI accessibility pass (ARIA, focus traps, keyboard-only flows)
-- [ ] Postgres migration path (SQLite → Postgres for production)
-- [ ] Slack / Discord / Mattermost bridge (import + export)
-- [ ] End-to-end message encryption (libsodium sealed boxes, key per
-      workspace)
+- [ ] End-to-end message encryption (libsodium sealed boxes, key per workspace)
 
-## v0.4.0 — Distribution
+## v1.3.x — Distribution & growth
 
 - [ ] Landing page (Docusaurus)
 - [ ] Public demo deployment with seeded data
@@ -68,13 +75,11 @@ Hardening pass before tagging a public release.
 - [ ] Homebrew / apt / nix packages
 - [ ] Multi-arch container images (linux/amd64 + linux/arm64)
 
-## v1.0.0 — Stability promise
-
-- [ ] Semantic versioning commitment
-- [ ] LTS branches (12 months security support per major)
+## v2.0 — Multi-tenant
+- [ ] Multi-tenant workspace model (cross-namespace isolation)
+- [ ] First external co-maintainer
 - [ ] Deprecation policy published
 - [ ] Governance doc (who decides what)
-- [ ] First external co-maintainer
 
 ---
 
@@ -84,4 +89,5 @@ Hardening pass before tagging a public release.
 |---------|------------|--------------------------------|
 | v0.1.0  | 2026-06-29 | Safe to publish                |
 | v0.2.0  | 2026-06-29 | Make it credible (hardening)   |
-| v0.3.0  | 2026-06-29 | Make it competitive (MCP, cookie session, reset) |
+| v1.0.0  | 2026-07-05 | LTS promise — single-namespace-per-server locked |
+| v1.1.0  | 2026-07-05 | Webhook ingress (HMAC-signed, retry+backoff, dedupe) + pip-installable |

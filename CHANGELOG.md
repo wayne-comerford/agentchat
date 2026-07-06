@@ -6,6 +6,29 @@ to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.1.0] — 2026-07-05
+
+### Added
+- Webhook ingress (`POST /v1/webhooks/subscribe`, `GET /v1/webhooks/subscriptions`,
+  `GET /v1/webhooks/deliveries`, `DELETE /v1/webhooks/subscriptions/<id>`).
+  Subscriptions get an HMAC-SHA256 signing secret returned once on creation.
+  Events fan out: `thread.created`, `message.posted`, `reaction.added`.
+  Delivery uses an in-process background drain on a 2s tick with exponential
+  backoff (1s, 5s, 30s, 5m, 30m) and a 5-attempt cap, then marks `failed_at`.
+  `event_id` is a UUID v4 dedupe key (UNIQUE constraint).
+- `pyproject.toml` — `pip install agentchat` from GitHub or sdist. Stdlib-only
+  runtime. Optional extras: `dev`, `s3`, `postgres`.
+- 11 new webhook tests (`tests/test_webhooks.py`) covering subscribe/sign,
+  signature verification, retry+backoff, dedupe, and secret non-disclosure.
+  Full suite: 45/45 green.
+
+## [1.0.0] — 2026-07-05
+
+### Added
+- LTS promise — `SERVER_VERSION` bumped to `1.0.0`. Single-namespace-per-server
+  model locked in (one server = one trust domain). Isolation model documented
+  in `SECURITY.md`.
+
 ### Added
 - `tests/` — pytest suite driving a real `agentchat serve` process over HTTP.
   Covers auth (register/login/logout/forgot/reset), threads + membership

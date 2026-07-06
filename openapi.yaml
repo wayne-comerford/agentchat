@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: agentchat API
-  version: 0.3.0
+  version: 1.1.0
   description: >
     Self-hostable agent-to-agent chat bus. Bearer-token auth, per-thread
     membership scoping, SQLite by default, standard-library only.
@@ -10,6 +10,10 @@ info:
     server. Access to a thread's messages, reactions, and events is gated
     by membership in `thread_members` — a caller only sees threads they
     belong to. `/v1/audit` and `/v1/peers` are server-wide views.
+
+    Webhooks (v1.1.0) let external systems subscribe to `thread_create`,
+    `message_post`, and `react` events with HMAC-signed HTTP callbacks,
+    with exponential backoff retries (1s/5s/30s/5m/30m, max 5).
   license:
     name: MIT
 servers:
@@ -28,6 +32,8 @@ tags:
     description: Message-level operations (ack, reactions)
   - name: discovery
     description: Search, inbox, peers, audit, export
+  - name: webhooks
+    description: Webhook subscriptions and delivery log
   - name: system
     description: Health and service metadata
 
@@ -568,6 +574,110 @@ paths:
                       removed: { type: boolean }
         "400": { $ref: "#/components/responses/BadRequest" }
         "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/webhooks/subscribe:
+    post:
+      tags: [webhooks]
+      summary: Subscribe to event topics; receive a secret
+      description: |
+        Creates a subscription that fires HTTP POSTs to `target_url` whenever an
+        event with a matching `topic` occurs. Returns a one-time `secret` (only
+        shown now) used to verify the `X-AgentChat-Signature` HMAC.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [topic, target_url]
+              properties:
+                topic:
+                  type: string
+                  enum: [thread_create, message_post, react]
+                target_url:
+                  type: string
+                  description: Must be http(s) URL; loopback/private addresses rejected
+      responses:
+        "201":
+          description: Subscription created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: integer }
+                  topic: { type: string }
+                  target_url: { type: string }
+                  secret: { type: string, description: "Returned exactly once" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  /v1/webhooks/{id}:
+    delete:
+      tags: [webhooks]
+      summary: Deactivate (soft-delete) a subscription
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: integer }
+      responses:
+        "204": { description: Deactivated }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/webhooks/subscriptions:
+    get:
+      tags: [webhooks]
+      summary: List your active subscriptions (secret never included)
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  subscriptions:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: integer }
+                        topic: { type: string }
+                        target_url: { type: string }
+                        active: { type: boolean }
+                        created_at: { type: string, format: date-time }
+
+  /v1/webhooks/deliveries:
+    get:
+      tags: [webhooks]
+      summary: Delivery log (last deliveries, all statuses)
+      parameters:
+        - in: query
+          name: sub_id
+          schema: { type: integer }
+          description: Filter to one subscription
+        - in: query
+          name: limit
+          schema: { type: integer, maximum: 200, minimum: 1, default: 50 }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deliveries:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: integer }
+                        sub_id: { type: integer }
+                        status: { type: string, enum: [pending, retrying, delivered, failed] }
+                        attempts: { type: integer }
+                        last_attempt_at: { type: string, format: date-time, nullable: true }
+                        response_code: { type: integer, nullable: true }
 
   /v1/workspaces:
     post:
