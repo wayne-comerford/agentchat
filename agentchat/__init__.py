@@ -73,7 +73,7 @@ LOG_PATH = AGENTCHAT_HOME / "server.log"
 
 DEFAULT_PORT = int(os.environ.get("AGENTCHAT_PORT", "7878"))
 DEFAULT_BIND = os.environ.get("AGENTCHAT_BIND", "0.0.0.0")
-SERVER_VERSION = "1.0.0"
+SERVER_VERSION = "1.1.3"
 
 MAX_BODY_BYTES = 64 * 1024  # 64 KiB per message
 THREAD_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_\-.]{0,63}$")
@@ -424,6 +424,37 @@ WEBHOOK_HTTP_TIMEOUT = float(os.environ.get("WEBHOOK_HTTP_TIMEOUT", "10.0"))
 
 # Backoff schedule in seconds. Index = attempt_count for the next attempt.
 WEBHOOK_BACKOFF = [1, 5, 30, 300, 1800]  # 1s, 5s, 30s, 5m, 30m
+
+# v1.1.3: Password-reset delivery. The legacy behaviour (token written to
+# server.log) is preserved as the default. Operators can opt into webhook
+# delivery via env vars. Stdlib only; no new deps.
+#
+#   AGENTCHAT_RESET_DELIVERY = webhook
+#     POSTs the reset URL to AGENTCHAT_RESET_WEBHOOK_URL with an HMAC
+#     signature (X-AgentChat-Signature). The webhook does NOT need to be
+#     registered via /v1/webhooks — it's an env-driven one-way out. The
+#     receiver can forward to email, Slack, Discord, SMS — anything that
+#     has an HTTP endpoint.
+#
+# AGENTCHAT_RESET_URL_BASE is the operator's web UI base; the handler
+# appends "/reset?token=<token>" for the operator's reset page to consume
+# and POST to /v1/auth/reset. If unset, only the bare token is logged (v0.3
+# behaviour).
+RESET_DELIVERY = os.environ.get("AGENTCHAT_RESET_DELIVERY", "log").lower().strip()
+RESET_URL_BASE = os.environ.get("AGENTCHAT_RESET_URL_BASE", "").rstrip("/")
+RESET_WEBHOOK_URL = os.environ.get("AGENTCHAT_RESET_WEBHOOK_URL", "").strip()
+RESET_WEBHOOK_SECRET = os.environ.get("AGENTCHAT_RESET_WEBHOOK_SECRET", "")
+RESET_WEBHOOK_TIMEOUT = float(os.environ.get("AGENTCHAT_RESET_WEBHOOK_TIMEOUT", "5.0"))
+
+# v1.2 roadmap: SMTP delivery (requires users.email column). Env knobs are
+# reserved here so operators can plan, but the SMTP path is not wired until
+# v1.2 ships the schema migration.
+SMTP_HOST = os.environ.get("AGENTCHAT_SMTP_HOST", "").strip()
+SMTP_PORT = int(os.environ.get("AGENTCHAT_SMTP_PORT", "587"))
+SMTP_USER = os.environ.get("AGENTCHAT_SMTP_USER", "")
+SMTP_PASSWORD = os.environ.get("AGENTCHAT_SMTP_PASSWORD", "")
+SMTP_FROM = os.environ.get("AGENTCHAT_SMTP_FROM", "noreply@agentchat.local")
+SMTP_TLS = os.environ.get("AGENTCHAT_SMTP_TLS", "starttls").lower().strip()  # starttls|ssl|none
 
 _VALID_WEBHOOK_TOPICS = frozenset({
     "thread.created",
@@ -1402,6 +1433,64 @@ def password_reset_request(username: str) -> Optional[str]:
         return plain
     finally:
         conn.close()
+
+
+def _reset_delivery_url(token: str) -> str:
+    """Compose the operator-facing reset URL. Returns "" if no base set."""
+    if not RESET_URL_BASE:
+        return ""
+    return f"{RESET_URL_BASE}/reset?token={token}"
+
+
+def _deliver_password_reset(username: str, token: str) -> None:
+    """v1.1.3: deliver a reset URL/token via the configured channel.
+
+    Channels (env-driven):
+      log (default)        — token to stderr/server.log (PASSWORD_RESET_TOKEN)
+      webhook              — POST to RESET_WEBHOOK_URL with HMAC sig
+
+    Failures are logged but never bubble up to the user — the /forgot
+    handler always returns 200 to prevent user enumeration.
+    """
+    reset_url = _reset_delivery_url(token)
+    if RESET_DELIVERY == "webhook" and RESET_WEBHOOK_URL:
+        payload = json.dumps({
+            "username": username,
+            "token": token,
+            "reset_url": reset_url,
+            "issued_at": now_iso(),
+            "expires_in_seconds": 3600,
+        }, separators=(",", ":")).encode("utf-8")
+        secret = RESET_WEBHOOK_SECRET.encode("utf-8") if RESET_WEBHOOK_SECRET else b""
+        sig = hmac.new(secret, payload, hashlib.sha256).hexdigest()
+        req = urllib.request.Request(
+            RESET_WEBHOOK_URL, data=payload, method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": f"agentchat-reset/{SERVER_VERSION}",
+                "X-AgentChat-Event": "password_reset",
+                "X-AgentChat-Signature": f"sha256={sig}",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=RESET_WEBHOOK_TIMEOUT) as resp:
+                resp.read(256)
+            log(f"RESET_WEBHOOK delivered user={username} status=ok url={RESET_WEBHOOK_URL}")
+        except Exception as e:
+            # Surface in logs but don't bubble — the caller already returned 200.
+            log(f"RESET_WEBHOOK failed user={username} {type(e).__name__}: {e}")
+        return
+
+    if RESET_DELIVERY == "smtp":
+        # v1.2: SMTP path is reserved but not wired (no users.email column).
+        # Fall through to log so the operator at least has the token.
+        log(f"RESET_DELIVERY=smtp is reserved for v1.2; falling back to log channel")
+
+    # log channel (legacy / fallback)
+    line = f"PASSWORD_RESET_TOKEN: username={username} token={token}"
+    if reset_url:
+        line += f" reset_url={reset_url}"
+    log(line)
 
 
 def password_reset_consume(plain_token: str, new_password: str) -> bool:
@@ -2459,10 +2548,9 @@ class AgentChatHandler(http.server.BaseHTTPRequestHandler):
         return self._send_json(200, {"ok": True, "revoked": revoked})
 
     def _handle_auth_forgot(self) -> None:
-        # v0.3: forgot-password. We have no mailer, so we log the reset URL
-        # to server.log (the self-hosted admin reads it). For a real
-        # deployment, override AGENTCHAT_RESET_DELIVERY=smtp to send via SMTP
-        # (TODO v0.3.1).
+        # v1.1.3: webhook delivery via AGENTCHAT_RESET_WEBHOOK_URL when
+        # AGENTCHAT_RESET_DELIVERY=webhook. Default still logs the token
+        # for self-hosted admins to relay manually.
         try:
             body = self._read_json()
         except ValueError as e:
@@ -2472,10 +2560,8 @@ class AgentChatHandler(http.server.BaseHTTPRequestHandler):
             return self._send_json(400, err("username required"))
         token = password_reset_request(username)
         if token:
-            # Log the reset token to stderr/server.log under a whitelisted prefix
-            # that bypasses the log scrubber. In a multi-user setup the server
-            # admin relays this to the user (TODO v0.3.1: SMTP/webhook delivery).
-            log(f"PASSWORD_RESET_TOKEN: username={username} token={token}")
+            # v1.1.3: delegate to the channel-aware delivery helper.
+            _deliver_password_reset(username, token)
         # Always return 200 with the same message — prevents user enumeration.
         return self._send_json(200, {
             "ok": True,
