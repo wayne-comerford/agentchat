@@ -6,6 +6,35 @@ to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (v1.2.0 — Nostr-native pivot, in progress)
+
+- **`agentchat.nostr` subpackage** — clean-room Python port of Nostr
+  primitives inspired by Block's Buzz (Apache-2.0 reference impl).
+  Wayne's pivot: instead of migrating to Buzz, we port what we need
+  into agentchat directly. No Rust toolchain. Single Python codebase.
+- **NIP-01 keypairs** — `NostrKeys` class with chmod-600 file load/save
+  (`load_keys`, `save_keys`). Refuses to load key files with group/world
+  read permissions.
+- **NIP-29 channel events** — `build_channel_create` (kind:9007),
+  `build_channel_message` (kind:9), `build_channel_metadata` (kind:39000),
+  with optional `#p` mention tags, `#e` reply tags, and `subject`
+  thread tags.
+- **User / reaction / delete events** — `build_user_metadata` (kind:0),
+  `build_reaction` (kind:7), `build_delete` (kind:5).
+- **NIP-19 bech32** — `pubkey_to_npub` / `bech32_to_pubkey` roundtrip.
+- **NIP-21 mention parser** — `parse_mentions(content)` extracts npub /
+  nprofile / note / naddr references from free-form text.
+- **NIP-42 auth** — `NIP42Challenge` with `build_auth_event` (client) and
+  `verify_response` (server). Replay protection via timestamp skew check.
+- **37 new tests** in `tests/test_nostr.py` — keys, events, signing,
+  bech32 roundtrip, mention parsing, NIP-42 auth handshake, tampered
+  signature rejection, expired-timestamp rejection.
+
+### Reference
+- Buzz relay binary at `/home/waynec/buzz/target/release/buzz-relay`
+  (reference impl for interop testing; 5-min MinIO port binding fix
+  pending per `docs/handoffs/buzz-spike-runbook.md`).
+
 ## [1.1.2] — 2026-07-06
 
 ### Added
