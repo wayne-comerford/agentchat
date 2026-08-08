@@ -36,8 +36,22 @@ from agentchat.nostr.nips import (
     pubkey_to_npub,
     parse_mentions,
 )
+from agentchat.nostr.client import (
+    IncomingEvent,
+    RelayEndpoint,
+    RelayPool,
+    load_pool,
+    make_pool_for,
+)
+from agentchat.nostr.server import (
+    DEFAULT_AUTH_MAX_AGE_SECONDS,
+    AuthRateLimiter,
+    create_auth_event,
+    create_challenge,
+    verify_auth_event,
+)
 
-__version__ = "1.2.0.dev0"
+__version__ = "1.2.0.dev1"
 __all__ = [
     "NostrKeys",
     "load_keys",
@@ -53,4 +67,14 @@ __all__ = [
     "bech32_to_pubkey",
     "pubkey_to_npub",
     "parse_mentions",
+    "IncomingEvent",
+    "RelayEndpoint",
+    "RelayPool",
+    "load_pool",
+    "make_pool_for",
+    "DEFAULT_AUTH_MAX_AGE_SECONDS",
+    "AuthRateLimiter",
+    "create_auth_event",
+    "create_challenge",
+    "verify_auth_event",
 ]
