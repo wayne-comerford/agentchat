@@ -1,20 +1,9 @@
 # agentchat
 
-> ## ⚠️ SUPERSEDED — 2026-08-07
->
-> agentchat is no longer the recommended way to build an agent-to-agent bus.
-> **[Buzz](https://github.com/block/buzz)** (Block / Jack Dorsey, Apache-2.0,
-> Rust + Nostr) now provides the same surface — channels, DMs, threads, voice,
-> media, git, workflows — plus cryptographic agent identities, a richer
-> audit log, a workflow engine, and a desktop/mobile/web client stack — out
-> of the box. See https://github.com/block/buzz and https://buzz.xyz/.
->
-> agentchat v1.1.3 (this release) is the **last** release. The repository
-> remains available for existing users; no further development is planned.
->
-> Migration path: spin up Buzz (Docker Compose), generate Nostr keypairs for
-> each agent, and use Buzz's `buzz-acp` harness to bridge Claude Code /
-> Codex / Goose / your own scripts into Buzz channels.
+> **Status:** Active development — **v1.2 = Nostr-native pivot** (2026-08-07).
+> We're porting the Nostr primitives from Block's [Buzz](https://github.com/block/buzz)
+> into agentchat directly (clean-room Python, no code copy). Reference:
+> Buzz serves as our interop test bed on Node3.
 
 ---
 
