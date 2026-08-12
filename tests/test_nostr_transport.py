@@ -125,9 +125,14 @@ class TestRelayPoolUnit:
         pool = RelayPool([RelayEndpoint("ws://localhost:3000")], fresh_keys)
         assert pool.unsubscribe("agentchat-sub-9999") is False
 
-    def test_publish_before_start_raises(self, fresh_keys):
-        pool = RelayPool([RelayEndpoint("ws://localhost:3000")], fresh_keys)
-        with pytest.raises(RuntimeError, match="not started"):
+    def test_publish_before_endpoints_init_raises(self, fresh_keys):
+        # publish_channel_message needs _endpoints set — verify guard
+        # (in normal flow, _endpoints is set in __init__; this simulates a
+        # malformed RelayPool object).
+        pool = RelayPool.__new__(RelayPool)
+        pool._endpoints = []
+        pool._keys = fresh_keys
+        with pytest.raises(RuntimeError, match="no relay endpoints"):
             pool.publish_channel_message("room", "hello")
 
 

@@ -85,10 +85,20 @@ class RelayPool:
 
     def __init__(
         self,
-        relays: Iterable[RelayEndpoint],
+        relays: Iterable[RelayEndpoint | str],
         keys: NostrKeys,
     ):
-        endpoints = list(relays)
+        # Accept either RelayEndpoint or str (ws://...) — wrap strings
+        endpoints: list[RelayEndpoint] = []
+        for r in relays:
+            if isinstance(r, RelayEndpoint):
+                endpoints.append(r)
+            elif isinstance(r, str):
+                endpoints.append(RelayEndpoint(url=r))
+            else:
+                raise TypeError(
+                    f"RelayPool relays must be RelayEndpoint or str, got {type(r).__name__}"
+                )
         if not endpoints:
             raise ValueError("at least one RelayEndpoint required")
         self._endpoints = endpoints
@@ -124,16 +134,21 @@ class RelayPool:
         """
         self._sub_counter += 1
         sub_id = f"agentchat-sub-{self._sub_counter}"
-        filt_dict: dict = {"#h": [channel_id], "kinds": [9]}
-        if since is not None:
-            filt_dict["since"] = since
-        if limit is not None:
-            filt_dict["limit"] = limit
-        self._subs[sub_id] = (filt_dict, callback)
 
         if self._started:
-            filters = FiltersList([Filters(**filt_dict)])
-            self._rm.add_subscription_on_all_relays(sub_id, filters)
+            # Build Filters with arbitrary #h tag (pynostr Filters doesn't
+            # expose #h as a kwarg; use add_arbitrary_tag)
+            filters_obj = Filters(kinds=[9])
+            if since is not None:
+                filters_obj.since = since
+            if limit is not None:
+                filters_obj.limit = limit
+            filters_obj.add_arbitrary_tag("h", [channel_id])
+            self._rm.add_subscription_on_all_relays(
+                sub_id, FiltersList([filters_obj])
+            )
+
+        self._subs[sub_id] = ({"#h": [channel_id], "kinds": [9]}, callback)
         return sub_id
 
     def unsubscribe(self, subscription_id: str) -> bool:
@@ -160,10 +175,13 @@ class RelayPool:
         Build, sign, and publish a NIP-29 channel message (kind:9).
         Returns the event id (hex).
 
-        Raises RuntimeError if the pool hasn't been started yet.
+        Uses pynostr to build + sign the event, but sends directly via raw
+        websockets (NOT through pynostr's RelayManager). Reason: pynostr's
+        Tornado IOLoop conflicts with aiohttp's asyncio loop, making publish
+        silently fail. The raw path works in any async context.
         """
-        if not self._started:
-            raise RuntimeError("RelayPool not started — call start_listen() first")
+        if not self._endpoints:
+            raise RuntimeError("RelayPool has no relay endpoints configured")
         ev = build_channel_message(
             keys=self._keys,
             group_id=channel_id,
@@ -171,8 +189,7 @@ class RelayPool:
             mentions=mentions,
         )
         ev.sign(self._keys.private_key.hex())
-        self._rm.publish_event(ev)
-        return ev.id
+        return _send_event_sync(ev, self._endpoints)
 
     def publish_channel_create(
         self,
@@ -182,12 +199,9 @@ class RelayPool:
         about: str = "",
     ) -> str:
         """Build, sign, and publish a NIP-29 GROUP_CREATE (kind:9007)."""
-        if not self._started:
-            raise RuntimeError("RelayPool not started — call start_listen() first")
         ev = build_channel_create(keys=self._keys, name=name, about=about)
         ev.sign(self._keys.private_key.hex())
-        self._rm.publish_event(ev)
-        return ev.id
+        return _send_event_sync(ev, self._endpoints)
 
     # ----- background thread ---------------------------------------------- #
 
@@ -228,8 +242,21 @@ class RelayPool:
 
         # Re-register any subscriptions added before start
         for sub_id, (filt_dict, _cb) in self._subs.items():
+            # Build Filters manually to support arbitrary tags like #h
+            filters_obj = Filters(
+                kinds=filt_dict.get("kinds"),
+                authors=filt_dict.get("authors"),
+                since=filt_dict.get("since"),
+                until=filt_dict.get("until"),
+                limit=filt_dict.get("limit"),
+            )
+            # Apply arbitrary tag filters (#h, #e, #p, #t, etc.)
+            for key, val in filt_dict.items():
+                if key.startswith("#") and isinstance(val, list):
+                    tag_letter = key[1:]
+                    filters_obj.add_arbitrary_tag(tag_letter, val)
             self._rm.add_subscription_on_all_relays(
-                sub_id, FiltersList([Filters(**filt_dict)])
+                sub_id, FiltersList([filters_obj])
             )
 
         # Open connections (Tornado IOLoop runs in a thread; we use daemon
@@ -311,6 +338,62 @@ def load_pool(
     """
     kp = load_keys(key_path)
     return make_pool_for(relays, kp)
+
+
+# --------------------------------------------------------------------------- #
+# Raw websocket transport (bypasses pynostr's Tornado IOLoop)
+# --------------------------------------------------------------------------- #
+
+def _send_event_sync(event, endpoints) -> str:
+    """
+    Publish `event` to all `endpoints` via raw websockets. Blocking.
+
+    For each endpoint:
+      1. Open WebSocket
+      2. Send ["EVENT", <event_dict>]
+      3. Wait for OK response (3s timeout)
+      4. Close
+
+    Returns the event id on first successful publish. If all relays fail,
+    raises the last exception.
+    """
+    import json as _json
+    import socket
+
+    import websockets.sync.client
+
+    payload = _json.dumps(["EVENT", event.to_dict()]).encode()
+    last_err: Exception | None = None
+
+    for ep in endpoints:
+        url = ep.url
+        try:
+            with websockets.sync.client.connect(
+                url, open_timeout=3, close_timeout=1
+            ) as ws:
+                ws.send(payload)
+                # Read until we get OK / closed / timeout
+                try:
+                    resp_raw = ws.recv(timeout=3)
+                    resp = _json.loads(resp_raw)
+                    if isinstance(resp, list) and len(resp) >= 3 and resp[0] == "OK":
+                        if resp[2] is True:
+                            return event.id
+                        else:
+                            last_err = RuntimeError(
+                                f"relay {url} rejected: {resp[3] if len(resp) > 3 else '?'}"
+                            )
+                            continue
+                except (TimeoutError, socket.timeout):
+                    # No OK within 3s — assume publish worked (relay didn't respond)
+                    return event.id
+        except Exception as e:
+            last_err = e
+            continue
+
+    if last_err:
+        raise last_err
+    return event.id
 
 
 __all__ = [

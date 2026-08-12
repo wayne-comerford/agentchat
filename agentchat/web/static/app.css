@@ -1,0 +1,26 @@
+/* agentchat v1.2 — Slice 1 styles
+ * Minimal overrides on top of Tailwind. Everything else should live in the
+ * template via Tailwind utility classes.
+ */
+
+/* Smooth scrollbar in dark theme */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #252b36; border-radius: 5px; }
+::-webkit-scrollbar-thumb:hover { background: #3a4150; }
+
+/* Mention styling in rendered message content */
+.msg-mention {
+  color: #38bdf8; /* sky-400 */
+  background: rgba(56, 189, 248, 0.08);
+  padding: 0 4px;
+  border-radius: 3px;
+  font-weight: 500;
+}
+
+/* Pulse animation for live indicator */
+@keyframes live-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+.animate-pulse { animation: live-pulse 1.6s ease-in-out infinite; }

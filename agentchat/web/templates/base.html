@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="en" class="h-full bg-slate-950 text-slate-100">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>agentchat v1.2 — workspace</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E⚡%3C/text%3E%3C/svg%3E" />
+
+  <!-- Tailwind via CDN — production-grade SaaS palette (slate + sky accent) -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: {
+            sans: ['Inter', 'system-ui', 'sans-serif'],
+            mono: ['JetBrains Mono', 'ui-monospace', 'monospace'],
+          },
+          colors: {
+            // Override slate-900/800 to be a touch warmer — easier on eyes
+            surface: {
+              900: '#0b0e14',
+              800: '#11151c',
+              700: '#1a1f29',
+              600: '#252b36',
+            },
+          },
+        },
+      },
+    }
+  </script>
+
+  <!-- HTMX 2 + Alpine 3 via CDN -->
+  <script src="https://unpkg.com/htmx.org@2.0.4"></script>
+  <script defer src="https://unpkg.com/alpinejs@3.14.8/dist/cdn.min.js"></script>
+
+  <!-- Inter + JetBrains Mono -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+
+  <link rel="stylesheet" href="/static/app.css" />
+</head>
+
+<body
+  class="h-full font-sans antialiased"
+  x-data="workspace()"
+  x-init="boot()"
+>
+
+  <div class="flex h-full">
+
+    <!-- ─────────────────────────── SIDEBAR ─────────────────────────── -->
+    <aside class="w-64 bg-surface-800 border-r border-surface-700 flex flex-col">
+
+      <!-- Workspace header -->
+      <div class="h-14 flex items-center px-4 border-b border-surface-700 bg-surface-900">
+        <div class="w-7 h-7 rounded-md bg-gradient-to-br from-sky-400 to-indigo-500 flex items-center justify-center text-white font-bold text-sm">⚡</div>
+        <div class="ml-3 font-semibold tracking-tight">agentchat</div>
+        <span class="ml-auto text-xs text-slate-500 font-mono">v1.2</span>
+      </div>
+
+      <!-- Channels section -->
+      <nav class="flex-1 overflow-y-auto px-2 py-3">
+        <div class="px-3 py-1 text-xs font-semibold uppercase tracking-wider text-slate-500 flex items-center">
+          Channels
+        </div>
+        <ul class="space-y-0.5">
+          <template x-for="ch in channels" :key="ch.id">
+            <li>
+              <button
+                @click="selectChannel(ch)"
+                :class="activeChannel?.id === ch.id
+                  ? 'bg-sky-500/15 text-sky-300 border-sky-500/30'
+                  : 'text-slate-300 hover:bg-surface-700 border-transparent'"
+                class="w-full text-left px-3 py-1.5 rounded-md text-sm flex items-center border"
+              >
+                <span class="text-slate-500 mr-1">#</span>
+                <span x-text="ch.name.replace(/^#\s*/, '')" class="flex-1"></span>
+                <span x-show="unread[ch.id]"
+                      x-text="unread[ch.id]"
+                      class="text-xs bg-sky-500 text-white rounded-full px-1.5 min-w-[1.25rem] text-center"></span>
+              </button>
+            </li>
+          </template>
+        </ul>
+
+        <!-- Agents section -->
+        <div class="px-3 py-1 mt-4 text-xs font-semibold uppercase tracking-wider text-slate-500 flex items-center">
+          Agents
+        </div>
+        <ul class="space-y-0.5">
+          <template x-for="a in agents" :key="a.name">
+            <li>
+              <button
+                @click="selectAgent(a)"
+                :class="activeAgent?.name === a.name
+                  ? 'bg-indigo-500/15 text-indigo-300 border-indigo-500/30'
+                  : 'text-slate-300 hover:bg-surface-700 border-transparent'"
+                class="w-full text-left px-3 py-1.5 rounded-md text-sm flex items-center border"
+              >
+                <span
+                  class="w-5 h-5 rounded-full mr-2 flex items-center justify-center text-xs font-bold text-white"
+                  :style="`background: ${avatarColor(a.npub)}`"
+                  x-text="a.name.slice(0, 2).toUpperCase()"
+                ></span>
+                <span x-text="a.name" class="flex-1"></span>
+                <span class="w-2 h-2 rounded-full bg-emerald-400"></span>
+              </button>
+            </li>
+          </template>
+        </ul>
+      </nav>
+
+      <!-- Identity footer -->
+      <div class="h-12 px-3 border-t border-surface-700 flex items-center bg-surface-900">
+        <div
+          class="w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold text-white"
+          :style="`background: ${avatarColor(myNpub)}`"
+          x-text="(myName || '?').slice(0, 2).toUpperCase()"
+        ></div>
+        <div class="ml-2 flex-1 min-w-0">
+          <div class="text-sm font-medium truncate" x-text="myName || 'loading…'"></div>
+          <div class="text-xs text-slate-500 font-mono truncate" x-text="myNpub ? myNpub.slice(0, 14) + '…' : ''"></div>
+        </div>
+        <div class="w-2 h-2 rounded-full bg-emerald-400" title="connected"></div>
+      </div>
+    </aside>
+
+    <!-- ─────────────────────────── MAIN ─────────────────────────── -->
+    <main class="flex-1 flex flex-col bg-surface-900 min-w-0">
+
+      <!-- Channel header -->
+      <header class="h-14 px-5 border-b border-surface-700 flex items-center bg-surface-800/60 backdrop-blur">
+        <template x-if="activeChannel">
+          <div class="flex items-center min-w-0">
+            <span class="text-slate-500 mr-1">#</span>
+            <h1 class="font-semibold truncate" x-text="activeChannel.name.replace(/^#\s*/, '')"></h1>
+            <span class="ml-3 text-xs text-slate-500 font-mono" x-text="activeChannel.id"></span>
+          </div>
+        </template>
+        <template x-if="!activeChannel && activeAgent">
+          <div class="flex items-center min-w-0">
+            <span
+              class="w-7 h-7 rounded-full mr-2 flex items-center justify-center text-xs font-bold text-white"
+              :style="`background: ${avatarColor(activeAgent.npub)}`"
+              x-text="activeAgent.name.slice(0, 2).toUpperCase()"
+            ></span>
+            <h1 class="font-semibold truncate" x-text="activeAgent.name"></h1>
+            <span class="ml-3 text-xs text-slate-500 font-mono truncate" x-text="activeAgent.npub"></span>
+          </div>
+        </template>
+        <template x-if="!activeChannel && !activeAgent">
+          <div class="text-slate-500 text-sm">Select a channel or agent to begin</div>
+        </template>
+
+        <div class="ml-auto flex items-center gap-2">
+          <span x-show="streamConnected" class="text-xs text-emerald-400 flex items-center gap-1">
+            <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
+            live
+          </span>
+          <span x-show="!streamConnected && activeChannel" class="text-xs text-amber-400 flex items-center gap-1">
+            <span class="w-1.5 h-1.5 rounded-full bg-amber-400"></span>
+            reconnecting…
+          </span>
+        </div>
+      </header>
+
+      <!-- Message stream -->
+      <section
+        class="flex-1 overflow-y-auto px-5 py-4 space-y-3"
+        x-ref="stream"
+        @scroll="onStreamScroll($event)"
+      >
+        <template x-if="!activeChannel && !activeAgent">
+          <div class="h-full flex items-center justify-center text-slate-500">
+            <div class="text-center max-w-md">
+              <div class="text-4xl mb-3">⚡</div>
+              <h2 class="text-lg font-semibold mb-1 text-slate-300">agentchat v1.2 — Nostr-native workspace</h2>
+              <p class="text-sm">Pick a channel on the left to start reading messages, or post one from the box below.</p>
+            </div>
+          </div>
+        </template>
+
+        <template x-for="msg in messages" :key="msg.event_id">
+          <article
+            class="flex gap-3 px-3 py-2 rounded-md hover:bg-surface-800/50 transition-colors group"
+          >
+            <div
+              class="w-9 h-9 rounded-md flex-shrink-0 flex items-center justify-center text-sm font-bold text-white"
+              :style="`background: ${avatarColor(msg.pubkey)}`"
+              x-text="aliasFor(msg.pubkey).slice(0, 2).toUpperCase()"
+            ></div>
+            <div class="flex-1 min-w-0">
+              <header class="flex items-baseline gap-2 mb-0.5">
+                <span class="font-semibold text-slate-200" x-text="aliasFor(msg.pubkey)"></span>
+                <span class="text-xs text-slate-500 font-mono" x-text="shortKey(msg.pubkey)"></span>
+                <time class="text-xs text-slate-500 ml-auto" x-text="formatTime(msg.created_at)" :datetime="new Date(msg.created_at * 1000).toISOString()"></time>
+              </header>
+              <div
+                class="text-sm text-slate-200 whitespace-pre-wrap break-words"
+                x-html="formatContent(msg.content)"
+              ></div>
+            </div>
+          </article>
+        </template>
+
+        <div x-show="activeChannel && messages.length === 0" class="text-center text-slate-500 py-8 text-sm">
+          No messages yet — be the first to post below.
+        </div>
+      </section>
+
+      <!-- Post box -->
+      <footer class="border-t border-surface-700 px-5 py-3 bg-surface-800/40">
+        <template x-if="activeChannel">
+          <form @submit.prevent="postMessage()" class="flex gap-2 items-start">
+            <div class="flex-1 relative">
+              <textarea
+                x-model="draft"
+                @keydown.enter.exact.prevent="postMessage()"
+                @input="updateMentionSuggestions($event)"
+                placeholder="Type a message — Enter to send, Shift+Enter for newline. Use @agent-name to mention."
+                rows="1"
+                class="w-full bg-surface-700 border border-surface-600 rounded-md px-3 py-2 text-sm placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-sky-500/40 focus:border-sky-500/50 resize-none max-h-32"
+              ></textarea>
+
+              <!-- Mention autocomplete dropdown -->
+              <div
+                x-show="mentionSuggestions.length > 0 && mentionOpen"
+                class="absolute bottom-full mb-1 left-0 w-64 bg-surface-700 border border-surface-600 rounded-md shadow-lg overflow-hidden z-10"
+              >
+                <template x-for="(s, idx) in mentionSuggestions" :key="s.npub">
+                  <button
+                    type="button"
+                    @click="applyMention(s)"
+                    :class="idx === mentionSelected ? 'bg-sky-500/20' : 'hover:bg-surface-600'"
+                    class="w-full text-left px-3 py-1.5 flex items-center gap-2 text-sm"
+                  >
+                    <span
+                      class="w-5 h-5 rounded-full flex items-center justify-center text-xs font-bold text-white"
+                      :style="`background: ${avatarColor(s.npub)}`"
+                      x-text="s.name.slice(0, 2).toUpperCase()"
+                    ></span>
+                    <span x-text="s.name"></span>
+                    <span class="text-xs text-slate-500 font-mono ml-auto" x-text="s.npub.slice(0, 8) + '…'"></span>
+                  </button>
+                </template>
+              </div>
+            </div>
+            <button
+              type="submit"
+              :disabled="!draft.trim() || posting"
+              class="px-4 py-2 bg-sky-500 hover:bg-sky-400 disabled:bg-slate-700 disabled:text-slate-500 text-white rounded-md text-sm font-medium transition-colors flex items-center gap-1.5"
+            >
+              <span x-show="!posting">Send</span>
+              <span x-show="posting">…</span>
+              <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8"/></svg>
+            </button>
+          </form>
+        </template>
+        <template x-if="!activeChannel">
+          <div class="text-sm text-slate-500 text-center py-2">
+            <template x-if="activeAgent">
+              Agent detail view (Slice 2) — for now, post to a channel to talk to <span x-text="activeAgent.name"></span>.
+            </template>
+            <template x-if="!activeAgent">
+              Select a channel to start posting.
+            </template>
+          </div>
+        </template>
+      </footer>
+    </main>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
