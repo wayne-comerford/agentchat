@@ -168,7 +168,7 @@
             <span class="ml-3 text-xs text-slate-500 font-mono" x-text="activeChannel.id"></span>
           </div>
         </template>
-        <template x-if="!activeChannel && activeAgent">
+        <template x-if="!activeChannel && activeAgent && activeAgent.name">
           <div class="flex items-center min-w-0">
             <span
               class="w-7 h-7 rounded-full mr-2 flex items-center justify-center text-xs font-bold text-white"
@@ -179,11 +179,11 @@
             <span class="ml-3 text-xs text-slate-500 font-mono truncate" x-text="activeAgent.npub"></span>
           </div>
         </template>
-        <template x-if="!activeChannel && !activeAgent">
+        <template x-if="!activeChannel && (!activeAgent || !activeAgent.name)">
           <div class="text-slate-500 text-sm">Select a channel or agent to begin</div>
         </template>
 
-        <div class="ml-auto flex items-center gap-2">
+        <!-- Channel header -->
           <span x-show="streamConnected" class="text-xs text-emerald-400 flex items-center gap-1">
             <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
             live
@@ -201,7 +201,7 @@
         x-ref="stream"
         @scroll="onStreamScroll($event)"
       >
-        <template x-if="!activeChannel && !activeAgent">
+        <template x-if="!activeChannel && (!activeAgent || !activeAgent.name)">
           <div class="h-full flex items-center justify-center text-slate-500">
             <div class="text-center max-w-md">
               <div class="text-4xl mb-3">⚡</div>
@@ -290,7 +290,7 @@
         <template x-if="!activeChannel">
           <div class="text-sm text-slate-500 text-center py-2">
             <template x-if="activeAgent">
-              Agent detail view (Slice 2) — for now, post to a channel to talk to <span x-text="activeAgent.name"></span>.
+              <span>Agent detail view (Slice 2) — for now, post to a channel to talk to <span x-text="activeAgent.name"></span>.</span>
             </template>
             <template x-if="!activeAgent">
               Select a channel to start posting.

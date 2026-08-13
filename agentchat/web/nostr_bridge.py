@@ -288,17 +288,25 @@ async def handle_post(request: web.Request) -> web.Response:
             {"error": "channel and content required"}, status=400
         )
 
-    # Resolve signer from session, falling back to bridge default.
+    # Resolve signer from session.  No session → 401, never fall back to
+    # bridge default identity (was a security hole: anyone on LAN could
+    # post as Hermes by hitting /v1/ui/post without a cookie).
     session_name = request.cookies.get("agentchat_session")
-    if session_name:
-        try:
-            signer = load_identity(session_name)
-            log.info("POST signing as session=%s (npub=%s)", session_name, signer.npub)
-        except Exception as e:
-            log.warning("session=%s invalid (%s); falling back to default", session_name, e)
-            signer = state.keys
-    else:
-        signer = state.keys
+    if not session_name:
+        return web.json_response(
+            {"error": "login required — POST /v1/auth/login first"},
+            status=401,
+        )
+
+    try:
+        signer = load_identity(session_name)
+        log.info("POST signing as session=%s (npub=%s)", session_name, signer.npub)
+    except Exception as e:
+        log.warning("session=%s invalid (%s); rejecting POST", session_name, e)
+        return web.json_response(
+            {"error": "session invalid — POST /v1/auth/login first"},
+            status=401,
+        )
 
     if signer is None:
         return web.json_response({"error": "no signer available"}, status=503)

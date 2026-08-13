@@ -187,8 +187,8 @@ async def test_post_signs_as_session_identity(aiohttp_client, tmp_keys, monkeypa
 
 
 @pytest.mark.asyncio
-async def test_post_falls_back_to_default_when_no_session(aiohttp_client, tmp_keys, monkeypatch):
-    """No cookie => use the bridge-default identity (hermes)."""
+async def test_post_rejects_when_no_session(aiohttp_client, tmp_keys, monkeypatch):
+    """No cookie => 401 (security: must not fall back to default identity)."""
     pairs, reg = tmp_keys
 
     captured = {}
@@ -199,6 +199,7 @@ async def test_post_falls_back_to_default_when_no_session(aiohttp_client, tmp_ke
 
         def stop_listen(self): pass
         def publish_channel_message(self, channel_id, content, mentions=None):
+            captured["published"] = True
             return "fake_event_id"
 
     monkeypatch.setattr(nb, "RelayPool", FakePool)
@@ -208,15 +209,16 @@ async def test_post_falls_back_to_default_when_no_session(aiohttp_client, tmp_ke
     client = await aiohttp_client(app)
 
     resp = await client.post("/v1/ui/post", json={"channel": "general", "content": "hi"})
-    assert resp.status == 200
-    assert captured["signed_with"] == pairs["hermes"].public_key_hex
-    data = await resp.json()
-    assert data["signed_by"] == pairs["hermes"].npub
+    assert resp.status == 401
+    assert "login required" in (await resp.json()).get("error", "").lower()
+    # No publish should have been called (FakePool.publish_channel_message
+    # would have raised; instead we check that no event was created).
+    assert captured.get("published") is None
 
 
 @pytest.mark.asyncio
-async def test_post_with_invalid_session_falls_back_to_default(aiohttp_client, tmp_keys, monkeypatch):
-    """Cookie set to nonexistent name => falls back to default."""
+async def test_post_rejects_when_invalid_session(aiohttp_client, tmp_keys, monkeypatch):
+    """Cookie set to nonexistent name => 401, never fall back to default."""
     pairs, reg = tmp_keys
 
     captured = {}
@@ -227,6 +229,7 @@ async def test_post_with_invalid_session_falls_back_to_default(aiohttp_client, t
 
         def stop_listen(self): pass
         def publish_channel_message(self, channel_id, content, mentions=None):
+            captured["published"] = True
             return "fake_event_id"
 
     monkeypatch.setattr(nb, "RelayPool", FakePool)
@@ -237,8 +240,9 @@ async def test_post_with_invalid_session_falls_back_to_default(aiohttp_client, t
     # Manually set a bogus cookie
     client.session.cookie_jar.update_cookies({"agentchat_session": "ghost"})
     resp = await client.post("/v1/ui/post", json={"channel": "general", "content": "hi"})
-    assert resp.status == 200
-    assert captured["signed_with"] == pairs["hermes"].public_key_hex
+    assert resp.status == 401
+    assert "session invalid" in (await resp.json()).get("error", "").lower()
+    assert captured.get("published") is None
 
 
 @pytest.mark.asyncio
@@ -258,6 +262,8 @@ async def test_post_extracts_mentions_in_payload(aiohttp_client, tmp_keys, monke
     app = nb.make_app(nb.DEFAULT_CONFIG)
     app["state"].registry = reg
     client = await aiohttp_client(app)
+    # Login first so POST is authorized (post-auth contract).
+    client.session.cookie_jar.update_cookies({"agentchat_session": "chappy"})
 
     await client.post("/v1/ui/post", json={
         "channel": "general",
