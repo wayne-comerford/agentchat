@@ -82,6 +82,9 @@ class ChappyLoop(ReplyLoop):
         if not reply or not reply.strip():
             log.info("[chappy] LLM returned empty reply; silent")
             return None
+        if reply.strip().lower().strip("*").strip() in {"silence", "(silence)", "no reply"}:
+            log.info("[chappy] LLM signalled silence; staying quiet")
+            return None
 
         return _sanitize_chappy_reply(reply)
 

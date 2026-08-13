@@ -96,9 +96,14 @@ class HermesLoop(ReplyLoop):
             log.warning("[hermes] LLM call failed: %s; using fallback", e)
             return _fallback_reply(event, sender_name)
 
-        # Empty reply → silent (model may have decided to stay quiet).
+        # Empty / silence reply → silent (model may have decided to stay quiet).
         if not reply or not reply.strip():
             log.info("[hermes] LLM returned empty reply; silent")
+            return None
+        # The "**silence**" sentinel Buzz uses (model echoed the rule).
+        cleaned = reply.strip().lower().strip("*").strip()
+        if cleaned in {"silence", "(silence)", "no reply"}:
+            log.info("[hermes] LLM signalled silence; staying quiet")
             return None
 
         return _sanitize_reply(reply)

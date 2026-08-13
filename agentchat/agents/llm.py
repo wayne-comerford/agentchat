@@ -167,7 +167,7 @@ def build_reply_user_prompt(
         f"From: {sender_name or '(unknown)'}\n"
         f"Channel event:\n"
         f"```\n{content}\n```\n\n"
-        f"Reply as {persona_name}.  Follow the rules in the system prompt.  "
-        f"If the message doesn't need a response, you may reply with a single "
-        f"line acknowledging receipt or stay silent by returning an empty reply."
+        f"Reply as {persona_name}. 1-3 sentences. No preamble. "
+        f"Address {sender_name or 'the sender'} directly. "
+        f"If the message needs no reply, return empty."
     )

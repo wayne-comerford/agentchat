@@ -234,6 +234,18 @@ async def test_hermes_silent_when_llm_returns_empty(tmp_keys, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_hermes_silent_when_llm_signals_silence(tmp_keys, monkeypatch):
+    """The '**silence**' sentinel Buzz uses → None."""
+    from agentchat.agents import hermes as hermes_mod
+    monkeypatch.setattr(hermes_mod, "call_llm", AsyncMock(return_value="**silence**"))
+    loop = make_hermes_loop()
+    body = await loop.decide_reply(
+        {"content": "@hermes thumbs up"}, sender_name="wayne-observer"
+    )
+    assert body is None
+
+
+@pytest.mark.asyncio
 async def test_hermes_strips_self_mention_in_reply(tmp_keys, mock_llm):
     """LLM replies must NOT contain @hermes — belt + braces on top of trigger gate."""
     loop = make_hermes_loop()
