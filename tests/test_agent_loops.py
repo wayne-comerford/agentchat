@@ -153,50 +153,109 @@ def test_triggers_persists_round_trip(tmp_path):
 # Concrete agent bodies
 # --------------------------------------------------------------------------- #
 
+@pytest.fixture
+def mock_llm(monkeypatch):
+    """Replace `call_llm` in both the llm module and the agent modules
+    (hermes/chappy import it directly).  Tests can override by setting
+    `mock_llm.return_value` or `mock_llm.side_effect`."""
+    from agentchat.agents import hermes as hermes_mod
+    from agentchat.agents import chappy as chappy_mod
+    from agentchat.agents import llm as llm_mod
+    mock = AsyncMock(return_value="@wayne-observer (mocked LLM reply)")
+    monkeypatch.setattr(llm_mod, "call_llm", mock)
+    monkeypatch.setattr(hermes_mod, "call_llm", mock)
+    monkeypatch.setattr(chappy_mod, "call_llm", mock)
+    return mock
+
+
 @pytest.mark.asyncio
-async def test_hermes_strips_mention_and_acknowledges(tmp_keys):
+async def test_hermes_calls_llm(tmp_keys, mock_llm):
     pairs, reg = tmp_keys
     loop = make_hermes_loop()
+    mock_llm.return_value = "@wayne-observer yes, dev6 shipped"
     body = await loop.decide_reply(
         {"content": "@hermes what's the status of dev6?"},
         sender_name="wayne-observer",
     )
     assert body is not None
-    assert "wayne-observer" in body
-    assert "what's the status of dev6?" in body
-    assert "@hermes" not in body  # stripped
+    assert "yes, dev6 shipped" in body
+    # The LLM was actually called.
+    mock_llm.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-async def test_hermes_handles_no_mention(tmp_keys):
+async def test_hermes_handles_no_mention(tmp_keys, mock_llm):
     pairs, _ = tmp_keys
     loop = make_hermes_loop()
+    mock_llm.return_value = "ack, status: green"
     body = await loop.decide_reply(
         {"content": "hey hermes, status?"},
         sender_name="wayne-observer",
     )
     assert body is not None
-    assert "status?" in body
+    assert "status: green" in body
 
 
 @pytest.mark.asyncio
-async def test_hermes_empty_content_returns_none(tmp_keys):
+async def test_hermes_empty_content_returns_none(tmp_keys, mock_llm):
     loop = make_hermes_loop()
     assert await loop.decide_reply({"content": ""}, "wayne-observer") is None
     assert await loop.decide_reply({"content": "   "}, "wayne-observer") is None
+    mock_llm.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_chappy_acks_with_tighter_tone(tmp_keys):
+async def test_hermes_falls_back_when_llm_fails(tmp_keys, monkeypatch):
+    """If the LLM raises, hermes returns the deterministic ack body."""
+    from agentchat.agents import hermes as hermes_mod
+    monkeypatch.setattr(
+        hermes_mod, "call_llm",
+        AsyncMock(side_effect=RuntimeError("quota 429")),
+    )
+    loop = make_hermes_loop()
+    body = await loop.decide_reply(
+        {"content": "@hermes ping"}, sender_name="wayne-observer"
+    )
+    assert body is not None
+    assert "heard you" in body  # fallback phrase
+    assert "ping" in body
+
+
+@pytest.mark.asyncio
+async def test_hermes_silent_when_llm_returns_empty(tmp_keys, monkeypatch):
+    """An empty LLM reply → None (silence)."""
+    from agentchat.agents import hermes as hermes_mod
+    monkeypatch.setattr(hermes_mod, "call_llm", AsyncMock(return_value=""))
+    loop = make_hermes_loop()
+    body = await loop.decide_reply(
+        {"content": "@hermes ping"}, sender_name="wayne-observer"
+    )
+    assert body is None
+
+
+@pytest.mark.asyncio
+async def test_hermes_strips_self_mention_in_reply(tmp_keys, mock_llm):
+    """LLM replies must NOT contain @hermes — belt + braces on top of trigger gate."""
+    loop = make_hermes_loop()
+    mock_llm.return_value = "@hermes oh hi there"  # LLM echoed back self-mention
+    body = await loop.decide_reply(
+        {"content": "@hermes hi"}, sender_name="wayne-observer"
+    )
+    assert body is not None
+    assert "@hermes" not in body  # sanitized out
+
+
+@pytest.mark.asyncio
+async def test_chappy_calls_llm(tmp_keys, mock_llm):
     loop = make_chappy_loop()
+    mock_llm.return_value = "@wayne-observer looking now"
     body = await loop.decide_reply(
         {"content": "@chappy ping me when ready"},
         sender_name="wayne-observer",
     )
     assert body is not None
-    assert "@wayne-observer" in body
-    assert "ping me when ready" in body
-    assert "On it" in body
+    assert "looking now" in body
+    mock_llm.assert_awaited_once()
 
 
 @pytest.mark.asyncio

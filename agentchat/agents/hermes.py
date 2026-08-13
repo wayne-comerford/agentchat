@@ -6,18 +6,56 @@ Reply policy (declarative, lives in `~/.hermes/nostr/personas/hermes.triggers.js
   - This is the Buzz persona pattern: behaviour lives in the persona file,
     not in code.
 
-In a later dev cycle, `decide_reply()` will hand off to an LLM call
-(RestTech-aware, agentchat-aware, etc.).  For now it's a deterministic
-acknowledgement so the loop architecture can be verified end-to-end.
+`decide_reply()` calls the LLM (via `agentchat.agents.llm.call_llm`) with
+the base prompt + persona prompt as the system message.  On any LLM
+failure (timeout, non-zero exit, empty reply), we fall back to the
+deterministic ack body so the channel stays responsive.
 """
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 from agentchat.agents.base import ReplyLoop
+from agentchat.agents.llm import call_llm, build_reply_user_prompt
 from agentchat.agents.personas import load_persona, persona_prompt
 from agentchat.agents.triggers import Triggers
 from agentchat.nostr.keys import load_keys
+
+log = logging.getLogger("agent-loop")
+
+
+# Path to the shared base prompt, written into the package by dev7.
+BASE_PROMPT_PATH = Path(__file__).parent / "base_prompt.md"
+
+
+def _strip_self_mention(content: str, name: str) -> str:
+    """Strip a leading `@name[,.:]?` mention if present."""
+    body = content
+    for sep in (" ", ",", ":"):
+        for prefix in (f"@{name}{sep}", f"@{name.lower()}{sep}"):
+            if body.lower().startswith(prefix):
+                return body[len(prefix):].lstrip()
+    return body
+
+
+def _fallback_reply(event: dict, sender_name: str | None) -> str:
+    """Deterministic ack used when the LLM call fails."""
+    body = _strip_self_mention((event.get("content") or "").strip(), "hermes")
+    return (
+        f"@{sender_name or 'there'} heard you: \"{body[:140]}\".\n"
+        f"Want me to dig into that, or just acknowledging?"
+    )
+
+
+def _sanitize_reply(reply: str) -> str:
+    """Belt + braces: strip any self-mention that would re-trigger the loop."""
+    # Drop leading "@hermes[,.: ]" so the relay doesn't see it as a #p tag.
+    body = _strip_self_mention(reply.strip(), "hermes")
+    # Strip accidental body mentions.
+    import re
+    body = re.sub(r"@hermes\b", "", body, flags=re.IGNORECASE)
+    return body.strip() or "(no reply)"
 
 
 class HermesLoop(ReplyLoop):
@@ -25,22 +63,45 @@ class HermesLoop(ReplyLoop):
     relay_url = "ws://127.0.0.1:9876"
     reply_cooldown_seconds = 1.0  # at most 1 reply/sec
 
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # Load persona once at startup so we don't re-read on every event.
+        self._persona = load_persona("hermes")
+        self._base_prompt = (
+            BASE_PROMPT_PATH.read_text() if BASE_PROMPT_PATH.exists() else ""
+        )
+
     async def decide_reply(self, event: dict, sender_name: str | None) -> str | None:
         content = (event.get("content") or "").strip()
         if not content:
             return None
 
-        # Strip any leading @hermes mention.
-        body = content
-        for prefix in ("@hermes ", "@hermes,", "@hermes:"):
-            if body.lower().startswith(prefix):
-                body = body[len(prefix):].lstrip()
-                break
-
-        return (
-            f"@{sender_name or 'there'} heard you: \"{body[:140]}\".\n"
-            f"Want me to dig into that, or just acknowledging?"
+        # Build system prompt: base rules + persona voice.
+        system_prompt = (
+            self._base_prompt
+            + "\n\n## Persona\n\n"
+            + (persona_prompt(self._persona) or "(no persona prompt on disk)")
         )
+
+        user_prompt = build_reply_user_prompt(
+            event=event,
+            sender_name=sender_name,
+            persona_name=self.name,
+        )
+
+        # LLM call with deterministic fallback on any failure.
+        try:
+            reply = await call_llm(system=system_prompt, user=user_prompt)
+        except Exception as e:
+            log.warning("[hermes] LLM call failed: %s; using fallback", e)
+            return _fallback_reply(event, sender_name)
+
+        # Empty reply → silent (model may have decided to stay quiet).
+        if not reply or not reply.strip():
+            log.info("[hermes] LLM returned empty reply; silent")
+            return None
+
+        return _sanitize_reply(reply)
 
 
 def make_hermes_loop() -> HermesLoop:
