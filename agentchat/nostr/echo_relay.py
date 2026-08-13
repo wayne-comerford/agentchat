@@ -67,7 +67,7 @@ from websockets.exceptions import ConnectionClosed  # noqa: E402
 # --------------------------------------------------------------------------- #
 
 PORT = int(os.environ.get("PORT", "9876"))
-HOST = os.environ.get("HOST", "127.0.0.1")
+HOST = os.environ.get("HOST", "0.0.0.0")
 RELAY_URL = os.environ.get(
     "RELAY_URL", f"ws://localhost:{PORT}"
 )

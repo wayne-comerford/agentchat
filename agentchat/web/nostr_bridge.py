@@ -50,6 +50,37 @@ from agentchat.nostr.client import RelayPool  # noqa: E402
 from agentchat.nostr.events import build_channel_message  # noqa: E402
 from agentchat.nostr.keys import NostrKeys, load_keys  # noqa: E402
 
+# Per-agent keypair registry (loaded lazily).
+# Path is overridable via AGENTCHAT_NOSTR_DIR for tests.
+def _identity_dir() -> Path:
+    override = os.environ.get("AGENTCHAT_NOSTR_DIR")
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".hermes" / "nostr"
+
+
+def _registry_path() -> Path:
+    return _identity_dir() / "registry.json"
+
+
+# Keep module-level aliases for backward compatibility — but resolve through
+# the helper so tests can override AGENTCHAT_NOSTR_DIR.
+IDENTITY_DIR = _identity_dir()
+REGISTRY_PATH = _registry_path()
+
+
+def _identity_path(name: str) -> Path:
+    """Map agent short name -> nsec.json file path."""
+    return _identity_dir() / f"{name}.nsec.json"
+
+
+def load_identity(name: str) -> NostrKeys:
+    """Load a keypair by short name (hermes/chappy/wayne-observer)."""
+    p = _identity_path(name)
+    if not p.exists():
+        raise FileNotFoundError(f"identity not found: {p}")
+    return load_keys(p)
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -64,7 +95,7 @@ log = logging.getLogger("nostr-bridge")
 # --------------------------------------------------------------------------- #
 
 DEFAULT_CONFIG = {
-    "listen": {"host": "127.0.0.1", "port": 9877},
+    "listen": {"host": "0.0.0.0", "port": 9877},
     "relays": ["ws://127.0.0.1:9876"],
     "identity": {
         "key_path": str(Path.home() / ".hermes" / "nostr" / "hermes.nsec.json"),
@@ -110,7 +141,21 @@ class BridgeState:
 
     async def startup(self) -> None:
         # Load identity
+        # Config key_path first; fall back to AGENTCHAT_NOSTR_DIR override (tests).
         kp_path = Path(self.config["identity"]["key_path"]).expanduser()
+        if not kp_path.exists():
+            override = _identity_dir() / kp_path.name
+            if override.exists():
+                kp_path = override
+        else:
+            # If AGENTCHAT_NOSTR_DIR is set and points at a directory that has
+            # the same key filename, prefer that path (lets tests inject
+            # keys without monkeypatching the config).
+            override_dir = _identity_dir()
+            if override_dir != Path.home() / ".hermes" / "nostr":
+                candidate = override_dir / kp_path.name
+                if candidate.exists():
+                    kp_path = candidate
         try:
             self.keys = load_keys(kp_path)
             log.info("Identity loaded: %s", self.keys.npub)
@@ -119,7 +164,7 @@ class BridgeState:
             raise
 
         # Load agent registry
-        registry_path = Path.home() / ".hermes" / "nostr" / "registry.json"
+        registry_path = _registry_path()
         if registry_path.exists():
             try:
                 with open(registry_path) as f:
@@ -217,12 +262,16 @@ async def handle_health(request: web.Request) -> web.Response:
 
 async def handle_post(request: web.Request) -> web.Response:
     """
-    Sign and publish a kind:9 message.
+    Sign and publish a kind:9 message as the LOGGED-IN identity.
 
     Body: { "channel": "<id>", "content": "<text>", "mentions": ["<pubkey-hex>", ...] }
+
+    The session cookie determines which keypair signs the event.  If no
+    session is present the bridge falls back to its default identity (kept
+    for backwards compat with the smoke tests).
     """
     state = get_state(request.app)
-    if state.pool is None or state.keys is None:
+    if state.pool is None:
         return web.json_response({"error": "bridge not started"}, status=503)
 
     try:
@@ -239,8 +288,26 @@ async def handle_post(request: web.Request) -> web.Response:
             {"error": "channel and content required"}, status=400
         )
 
+    # Resolve signer from session, falling back to bridge default.
+    session_name = request.cookies.get("agentchat_session")
+    if session_name:
+        try:
+            signer = load_identity(session_name)
+            log.info("POST signing as session=%s (npub=%s)", session_name, signer.npub)
+        except Exception as e:
+            log.warning("session=%s invalid (%s); falling back to default", session_name, e)
+            signer = state.keys
+    else:
+        signer = state.keys
+
+    if signer is None:
+        return web.json_response({"error": "no signer available"}, status=503)
+
+    # Build a per-signer pool so the right key signs the event.
+    pool = RelayPool(relays=state.config["relays"], keys=signer)
+
     try:
-        event_id = state.pool.publish_channel_message(
+        event_id = pool.publish_channel_message(
             channel_id=channel,
             content=content,
             mentions=mentions,
@@ -249,10 +316,100 @@ async def handle_post(request: web.Request) -> web.Response:
             "ok": True,
             "event_id": event_id,
             "channel": channel,
+            "signed_by": signer.npub,
         })
     except Exception as e:
         log.warning("publish failed: %s", e)
         return web.json_response({"error": str(e)}, status=500)
+
+
+# --------------------------------------------------------------------------- #
+# Auth (login / logout / whoami)
+# --------------------------------------------------------------------------- #
+
+COOKIE_NAME = "agentchat_session"
+COOKIE_MAX_AGE = 60 * 60 * 8  # 8 hours
+
+
+async def handle_login(request: web.Request) -> web.Response:
+    """
+    POST /v1/auth/login   { "name": "hermes" | "chappy" | "wayne-observer" }
+
+    Loads the keypair, sets a session cookie, returns the npub.  Anyone on
+    the LAN can log in as any local agent — this is a developer-facing
+    bridge, not a production auth system.  Add a real auth layer before
+    exposing this publicly.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON"}, status=400)
+
+    name = (body.get("name") or "").strip()
+    if not name:
+        return web.json_response({"error": "name required"}, status=400)
+
+    try:
+        kp = load_identity(name)
+    except FileNotFoundError as e:
+        return web.json_response({"error": str(e)}, status=404)
+
+    resp = web.json_response({
+        "ok": True,
+        "name": name,
+        "npub": kp.npub,
+        "public_key_hex": kp.public_key_hex,
+    })
+    resp.set_cookie(
+        COOKIE_NAME,
+        name,
+        max_age=COOKIE_MAX_AGE,
+        httponly=True,
+        samesite="Lax",
+        path="/",
+    )
+    log.info("login: %s -> %s", name, kp.npub)
+    return resp
+
+
+async def handle_logout(request: web.Request) -> web.Response:
+    resp = web.json_response({"ok": True})
+    resp.del_cookie(COOKIE_NAME, path="/")
+    return resp
+
+
+async def handle_whoami(request: web.Request) -> web.Response:
+    """GET /v1/auth/whoami — name + npub from session cookie (or anonymous)."""
+    state = get_state(request.app)
+    name = request.cookies.get(COOKIE_NAME)
+    if not name:
+        return web.json_response({
+            "logged_in": False,
+            "default_identity": state.keys.npub if state.keys else None,
+        })
+    try:
+        kp = load_identity(name)
+        return web.json_response({
+            "logged_in": True,
+            "name": name,
+            "npub": kp.npub,
+            "public_key_hex": kp.public_key_hex,
+        })
+    except Exception as e:
+        return web.json_response({"logged_in": False, "error": str(e)})
+
+
+async def handle_identities(request: web.Request) -> web.Response:
+    """GET /v1/auth/identities — list of available identities for the login UI."""
+    state = get_state(request.app)
+    out = []
+    for name, info in state.registry.items():
+        out.append({
+            "name": name,
+            "npub": info.get("npub"),
+            "public_key_hex": info.get("public_key_hex"),
+        })
+    return web.json_response(out)
 
 
 # --------------------------------------------------------------------------- #
@@ -403,6 +560,8 @@ def make_app(config: dict) -> web.Application:
         middlewares=[cors_middleware],
         client_max_size=1024 * 1024,
     )
+    # Attach state eagerly so tests can patch it before the first request.
+    app["state"] = state
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
 
@@ -413,6 +572,10 @@ def make_app(config: dict) -> web.Application:
     app.router.add_get("/v1/ui/agents", handle_agents)
     app.router.add_get("/v1/ui/stream", handle_stream)
     app.router.add_post("/v1/ui/post", handle_post)
+    app.router.add_post("/v1/auth/login", handle_login)
+    app.router.add_post("/v1/auth/logout", handle_logout)
+    app.router.add_get("/v1/auth/whoami", handle_whoami)
+    app.router.add_get("/v1/auth/identities", handle_identities)
     return app
 
 

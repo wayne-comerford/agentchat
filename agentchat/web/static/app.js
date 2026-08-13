@@ -1,5 +1,5 @@
-// agentchat v1.2 — Slice 1 client logic
-// Alpine.js workspace() — manages channels, agents, messages, SSE stream.
+// agentchat v1.2 — Slice 1 client logic (with auth)
+// Alpine.js workspace() — manages channels, agents, messages, SSE stream, login.
 
 const NOSTR_BECH32 = /^npub1[0-9a-z]{20,60}$/i;
 
@@ -8,6 +8,7 @@ function workspace() {
     // ─────────── state ───────────
     channels: [],
     agents: [],
+    identities: [],          // available identities from /v1/auth/identities
     messages: [],
     activeChannel: null,
     activeAgent: null,
@@ -25,24 +26,60 @@ function workspace() {
 
     // ─────────── bootstrap ───────────
     async boot() {
-      // Load channels + agents
       try {
-        const [chRes, agRes, health] = await Promise.all([
-          fetch('/v1/ui/channels').then(r => r.json()),
-          fetch('/v1/ui/agents').then(r => r.json()),
-          fetch('/health').then(r => r.json()),
+        const [chRes, agRes, who, ids] = await Promise.all([
+          fetch('/v1/ui/channels', { credentials: 'same-origin' }).then(r => r.json()),
+          fetch('/v1/ui/agents', { credentials: 'same-origin' }).then(r => r.json()),
+          fetch('/v1/auth/whoami', { credentials: 'same-origin' }).then(r => r.json()),
+          fetch('/v1/auth/identities', { credentials: 'same-origin' }).then(r => r.json()),
         ]);
         this.channels = chRes;
         this.agents = agRes;
-        this.myNpub = health.identity || '';
-        // Pick name from agents by matching npub
-        const mine = agRes.find(a => a.npub === this.myNpub);
-        this.myName = mine ? mine.name : (this.myNpub ? this.myNpub.slice(0, 8) + '…' : 'me');
+        this.identities = ids;
+        if (who.logged_in) {
+          this.myName = who.name;
+          this.myNpub = who.npub;
+        } else {
+          this.myName = '';
+          this.myNpub = '';
+        }
       } catch (e) {
         console.error('boot failed', e);
       }
       // Auto-select first channel
       if (this.channels.length > 0) this.selectChannel(this.channels[0]);
+    },
+
+    // ─────────── auth ───────────
+    async login(name) {
+      try {
+        const res = await fetch('/v1/auth/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'same-origin',
+          body: JSON.stringify({ name }),
+        });
+        const data = await res.json();
+        if (!data.ok) {
+          alert('login failed: ' + (data.error || 'unknown'));
+          return;
+        }
+        this.myName = data.name;
+        this.myNpub = data.npub;
+      } catch (e) {
+        alert('login error: ' + e.message);
+      }
+    },
+
+    async logout() {
+      try {
+        await fetch('/v1/auth/logout', {
+          method: 'POST',
+          credentials: 'same-origin',
+        });
+      } catch (e) { /* ignore */ }
+      this.myName = '';
+      this.myNpub = '';
     },
 
     // ─────────── selection ───────────
@@ -105,20 +142,25 @@ function workspace() {
     // ─────────── post ───────────
     async postMessage() {
       if (!this.activeChannel || !this.draft.trim() || this.posting) return;
+      if (!this.myName) {
+        alert('Sign in first (click ⇅ at the bottom of the sidebar).');
+        return;
+      }
       this.posting = true;
 
-      // Extract @mentions from draft (strip mention markers from body before sending)
+      // Extract @mentions from draft
       const mentions = [];
-      const stripped = this.draft.replace(/@([a-zA-Z0-9_-]+)/g, (m, name) => {
+      this.draft.replace(/@([a-zA-Z0-9_-]+)/g, (m, name) => {
         const a = this.agents.find(x => x.name === name);
         if (a) mentions.push(a.public_key_hex);
-        return m; // keep visible in UI; relay will store the text as-is
+        return m;
       });
 
       try {
         const res = await fetch('/v1/ui/post', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
+          credentials: 'same-origin',
           body: JSON.stringify({
             channel: this.activeChannel.id,
             content: this.draft,
@@ -218,7 +260,6 @@ function workspace() {
     },
 
     avatarColor(seed) {
-      // Deterministic pleasant color from seed
       if (!seed) return '#475569';
       let h = 0;
       for (let i = 0; i < seed.length; i++) {
