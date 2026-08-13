@@ -5,21 +5,16 @@ Each agent in agentchat is an independent reply loop.  The loop:
 
   1. Connects to the configured Nostr relay (single WS connection).
   2. Subscribes to kind:9 events where the agent's npub is in the #p tags.
-  3. Filters out events the agent shouldn't reply to:
-     - Events authored by another agent (avoids a2a loops).
-     - Events authored by itself (self-mentions).
-     - Events the agent already replied to (idempotent).
+  3. Filters events through `Triggers.should_reply()` (Buzz pattern, ported
+     from `crates/buzz-persona/src/persona.rs::RespondTo`).  Loop prevention
+     is a *natural consequence* of the trigger: hermes's reply contains no
+     `@hermes`, no keywords → silent on the way out.
   4. Calls the agent's `decide_reply(event)` to produce a reply body.
   5. Signs the reply with the agent's own keypair and publishes it.
   6. Tracks the event id it just replied to in a per-agent dedupe store.
 
-This is the Buzz pattern: each agent owns its reply state, no shared
-global table.  It is structurally impossible for two agents to reply
-to each other in a loop because each agent independently checks
-"is the sender also an agent?" before responding.
-
 Concrete subclasses override `decide_reply()` to produce a body.  The
-base class handles the relay I/O and the gating.
+base class handles the relay I/O, the trigger gate, dedupe, and publishing.
 """
 from __future__ import annotations
 
@@ -34,6 +29,7 @@ from typing import Any, Awaitable, Callable
 
 import websockets
 
+from agentchat.agents.triggers import Triggers
 from agentchat.nostr.events import build_channel_message
 from agentchat.nostr.keys import NostrKeys, load_keys
 
@@ -102,7 +98,7 @@ class ReplyLoop:
         self,
         keys: NostrKeys,
         *,
-        agent_pubkeys: set[str] | None = None,
+        triggers: Triggers | None = None,
         dedupe_path: Path | None = None,
         subscribe_kinds: tuple[int, ...] = (9,),
     ) -> None:
@@ -112,8 +108,8 @@ class ReplyLoop:
             raise ValueError("ReplyLoop subclass must set .relay_url")
         self.keys = keys
         self.pubkey = keys.public_key_hex.lower()
-        # Set of known agent pubkeys (we don't reply to a2a traffic).
-        self.agent_pubkeys = agent_pubkeys or set()
+        # Triggers gate (Buzz pattern).  Default = wake on @mention only.
+        self.triggers = triggers or Triggers()
         self.dedupe = ReplyDedupe(dedupe_path or Path(f"/tmp/agentchat_{self.name}_dedupe.json"))
         self.subscribe_kinds = subscribe_kinds
         self._last_reply_ts: float = 0.0
@@ -201,21 +197,19 @@ class ReplyLoop:
         if not sender:
             return
 
-        # Skip self-mentions.
+        # Self-mention skip.
         if sender == self.pubkey:
             return
 
-        # Skip agent-to-agent traffic (loop prevention).
-        if sender in self.agent_pubkeys:
-            log.debug("[%s] skipping a2a event %s", self.name, eid[:12])
+        # Trigger gate (Buzz pattern) — single decision point.
+        if not self.triggers.should_reply(
+            ev, agent_pubkey=self.pubkey, sender_pubkey=sender
+        ):
+            log.debug("[%s] trigger did not fire for %s", self.name, eid[:12])
             return
 
         # Find sender name from registry if known.
-        sender_name = None
-        for pk, name in self._registry_lookup():
-            if pk == sender:
-                sender_name = name
-                break
+        sender_name = self._sender_name(sender)
 
         # Cooldown gate.
         now = time.time()
@@ -273,14 +267,16 @@ class ReplyLoop:
                 return str(tag[1])
         return None
 
-    def _registry_lookup(self) -> list[tuple[str, str]]:
-        """Subclasses can override to provide their own agent set.
-        Default: read registry.json fresh each call (cheap enough for v1)."""
+    def _sender_name(self, sender_pubkey: str) -> str | None:
+        """Look up a sender pubkey in the registry to get a friendly name."""
         path = Path.home() / ".hermes" / "nostr" / "registry.json"
         if not path.exists():
-            return []
+            return None
         try:
             reg = json.loads(path.read_text())
         except Exception:
-            return []
-        return [(info["public_key_hex"].lower(), name) for name, info in reg.items()]
+            return None
+        for name, info in reg.items():
+            if str(info.get("public_key_hex", "")).lower() == sender_pubkey:
+                return name
+        return None

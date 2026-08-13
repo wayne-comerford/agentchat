@@ -1,17 +1,23 @@
 """
 Hermes agent — primary agent for Wayne.
 
-Reply policy:
-  - Only replies to principals (Wayne / wayne-observer).
-  - Default body: acknowledge and ask if there's anything actionable.
+Reply policy (declarative, lives in `~/.hermes/nostr/personas/hermes.triggers.json`):
+  - Default: wake on @hermes mention only.
+  - This is the Buzz persona pattern: behaviour lives in the persona file,
+    not in code.
 
 In a later dev cycle, `decide_reply()` will hand off to an LLM call
 (RestTech-aware, agentchat-aware, etc.).  For now it's a deterministic
 acknowledgement so the loop architecture can be verified end-to-end.
 """
-from agentchat.agents.base import ReplyLoop
-from agentchat.nostr.keys import load_keys
+from __future__ import annotations
+
 from pathlib import Path
+
+from agentchat.agents.base import ReplyLoop
+from agentchat.agents.personas import load_persona, persona_prompt
+from agentchat.agents.triggers import Triggers
+from agentchat.nostr.keys import load_keys
 
 
 class HermesLoop(ReplyLoop):
@@ -31,18 +37,18 @@ class HermesLoop(ReplyLoop):
                 body = body[len(prefix):].lstrip()
                 break
 
-        # Acknowledgement + ask whether there's real work.
         return (
             f"@{sender_name or 'there'} heard you: \"{body[:140]}\".\n"
             f"Want me to dig into that, or just acknowledging?"
         )
 
 
-def make_hermes_loop(agent_pubkeys: set[str] | None = None) -> HermesLoop:
+def make_hermes_loop() -> HermesLoop:
+    persona = load_persona("hermes")
     kp = load_keys(_identity_path("hermes"))
     return HermesLoop(
         keys=kp,
-        agent_pubkeys=agent_pubkeys,
+        triggers=persona.triggers,
         dedupe_path=_identity_dir() / "hermes_dedupe.json",
     )
 

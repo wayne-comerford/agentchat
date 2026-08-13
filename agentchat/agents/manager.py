@@ -1,10 +1,15 @@
 """
 Agent manager — runs all enabled ReplyLoops concurrently.
 
-Reads ~/.hermes/nostr/registry.json, picks entries with kind="agent",
-loads their keypairs, instantiates the matching ReplyLoop subclass,
-and runs each as an asyncio task.  Each loop has its own WS connection
-to the relay.
+Reads ~/.hermes/nostr/registry.json, loads each identity's keypair,
+checks for a matching ReplyLoop factory in AGENT_FACTORIES, and runs
+each as an asyncio task.  Each loop has its own WS connection to the
+relay and its own Triggers (loaded from
+~/.hermes/nostr/personas/<name>.triggers.json).
+
+Loop prevention is now declarative (per-agent triggers), not registry-
+based.  The manager doesn't care about agent-vs-principal classification —
+that lives in the persona's triggers file.
 
 Usage:
     .venv/bin/python -m agentchat.agents.manager
@@ -47,22 +52,6 @@ def _load_registry() -> dict[str, dict]:
         return {}
 
 
-def _agent_pubkeys(reg: dict[str, dict]) -> set[str]:
-    return {
-        info["public_key_hex"].lower()
-        for info in reg.values()
-        if info.get("kind") == "agent" and "public_key_hex" in info
-    }
-
-
-def _agent_pub_to_name(reg: dict[str, dict]) -> dict[str, str]:
-    return {
-        info["public_key_hex"].lower(): name
-        for name, info in reg.items()
-        if "public_key_hex" in info
-    }
-
-
 def _build_loops() -> list[ReplyLoop]:
     """Import the agent modules on demand (avoids requiring every
     agent's deps to be installed for tests)."""
@@ -76,19 +65,16 @@ def _build_loops() -> list[ReplyLoop]:
     })
 
     reg = _load_registry()
-    agent_pubs = _agent_pubkeys(reg)
-    log.info("registry: %d identities, %d agents", len(reg), len(agent_pubs))
+    log.info("registry: %d identities", len(reg))
 
     loops: list[ReplyLoop] = []
     for name, info in reg.items():
-        if info.get("kind") != "agent":
-            continue
         factory = AGENT_FACTORIES.get(name)
         if not factory:
-            log.warning("no loop factory for agent '%s'; skipping", name)
+            log.debug("no loop factory for '%s'; skipping", name)
             continue
         try:
-            loops.append(factory(agent_pubkeys=agent_pubs))
+            loops.append(factory())
         except Exception as e:
             log.warning("failed to instantiate %s loop: %s", name, e)
 

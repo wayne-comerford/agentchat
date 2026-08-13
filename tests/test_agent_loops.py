@@ -1,17 +1,19 @@
 """
-Tests for the per-agent reply loop (dev6).
+Tests for the per-agent reply loop (dev6 + dev7 persona system).
 
 Coverage:
+  - Triggers gate: mentions / keywords / all_messages / from_authors / self.
   - HermesLoop.decide_reply produces a body, strips @hermes prefix.
   - ChappyLoop.decide_reply produces a body, strips @chappy prefix.
-  - WayneObserverLoop.decide_reply returns None (principal).
+  - WayneObserverLoop.decide_reply returns None (silent persona).
   - ReplyLoop._handle_event gating rules:
       * self-mention -> skipped (no decide call)
-      * a2a event    -> skipped (no decide call)
+      * trigger mismatch -> skipped (no decide call)
       * already seen -> skipped (no decide call)
       * cooldown     -> skipped (no decide call)
       * fresh principal event -> decide called, body published
   - ReplyDedupe persistence + size cap
+  - Manager only loads entries that have a factory
 """
 import asyncio
 import json
@@ -25,6 +27,7 @@ import pytest
 from agentchat.agents import base as base_mod
 from agentchat.agents.chappy import ChappyLoop, make_chappy_loop
 from agentchat.agents.hermes import HermesLoop, make_hermes_loop
+from agentchat.agents.triggers import Triggers
 from agentchat.agents.wayne_observer import WayneObserverLoop
 from agentchat.nostr.keys import NostrKeys
 
@@ -35,9 +38,11 @@ from agentchat.nostr.keys import NostrKeys
 
 @pytest.fixture
 def tmp_keys(tmp_path, monkeypatch):
+    """Isolated key store with 3 identities + registry + persona triggers."""
     home = tmp_path / ".hermes"
     nostr = home / "nostr"
-    nostr.mkdir(parents=True)
+    personas = nostr / "personas"
+    personas.mkdir(parents=True)
     monkeypatch.setenv("AGENTCHAT_NOSTR_DIR", str(nostr))
 
     pairs = {}
@@ -53,10 +58,95 @@ def tmp_keys(tmp_path, monkeypatch):
         reg[name] = {
             "public_key_hex": kp.public_key_hex,
             "npub": kp.npub,
-            "kind": "agent" if name != "wayne-observer" else "principal",
+            "description": f"test {name}",
         }
+        # Default triggers: hermes/chappy wake on mention; wayne silent.
+        triggers = (
+            {"mentions": True, "keywords": [], "all_messages": False, "from_authors": []}
+            if name != "wayne-observer"
+            else {"mentions": False, "keywords": [], "all_messages": False, "from_authors": []}
+        )
+        (personas / f"{name}.triggers.json").write_text(json.dumps(triggers))
     (nostr / "registry.json").write_text(json.dumps(reg))
     return pairs, reg
+
+
+# --------------------------------------------------------------------------- #
+# Triggers (Buzz pattern port)
+# --------------------------------------------------------------------------- #
+
+def _event(content="hi", tags=None, pubkey="aa" * 32, kind=9):
+    return {
+        "id": "e" + "0" * 63,
+        "pubkey": pubkey,
+        "kind": kind,
+        "content": content,
+        "tags": tags or [],
+    }
+
+
+def test_triggers_default_wakes_on_mention():
+    t = Triggers()  # default mentions=True
+    ev = _event(tags=[["p", "bb" * 32]])
+    assert t.should_reply(ev, agent_pubkey="bb" * 32, sender_pubkey="cc" * 32)
+
+
+def test_triggers_mention_requires_my_pubkey_in_p_tags():
+    t = Triggers()
+    ev = _event(tags=[["p", "aa" * 32]])  # someone else mentioned
+    assert not t.should_reply(ev, agent_pubkey="bb" * 32, sender_pubkey="cc" * 32)
+
+
+def test_triggers_keyword_match_case_insensitive():
+    t = Triggers(mentions=False, keywords=["urgent", "deploy"])
+    ev = _event(content="please DEPLOY now")
+    assert t.should_reply(ev, agent_pubkey="bb" * 32, sender_pubkey="cc" * 32)
+
+
+def test_triggers_keyword_no_match():
+    t = Triggers(mentions=False, keywords=["urgent"])
+    ev = _event(content="no match here")
+    assert not t.should_reply(ev, agent_pubkey="bb" * 32, sender_pubkey="cc" * 32)
+
+
+def test_triggers_all_messages_wakes_for_everyone():
+    t = Triggers(mentions=False, all_messages=True)
+    ev = _event(content="anything")
+    assert t.should_reply(ev, agent_pubkey="bb" * 32, sender_pubkey="cc" * 32)
+
+
+def test_triggers_self_always_false():
+    t = Triggers(all_messages=True)  # even the broadest
+    assert not t.should_reply(_event(), agent_pubkey="cc" * 32, sender_pubkey="cc" * 32)
+
+
+def test_triggers_from_authors_allowlist():
+    t = Triggers(mentions=True, from_authors=["dd" * 32])
+    ev = _event(tags=[["p", "bb" * 32]])
+    assert not t.should_reply(ev, agent_pubkey="bb" * 32, sender_pubkey="cc" * 32)
+    assert t.should_reply(ev, agent_pubkey="bb" * 32, sender_pubkey="dd" * 32)
+
+
+def test_triggers_loop_safety_by_construction():
+    """Hermes's reply won't trigger hermes.  No #p=self, no keywords by default."""
+    t = Triggers()  # default
+    # Hermes's own reply
+    reply = _event(
+        content="@wayne-observer got it",
+        pubkey="hermes" + "0" * 58,  # hermes's pubkey
+        tags=[["p", "wayne" + "0" * 60]],  # mentions wayne, not hermes
+    )
+    assert not t.should_reply(reply, agent_pubkey="hermes" + "0" * 58, sender_pubkey="hermes" + "0" * 58)
+
+
+def test_triggers_persists_round_trip(tmp_path):
+    p = tmp_path / "t.json"
+    Triggers(mentions=False, keywords=["foo"]).save(p)
+    loaded = Triggers.load(p)
+    assert loaded.mentions is False
+    assert loaded.keywords == ["foo"]
+    # Missing file → defaults
+    assert Triggers.load(tmp_path / "missing.json").mentions is True
 
 
 # --------------------------------------------------------------------------- #
@@ -128,10 +218,7 @@ async def test_wayne_observer_never_replies(tmp_keys):
 @pytest.mark.asyncio
 async def test_handle_event_skips_self_mention(tmp_keys, monkeypatch):
     pairs, reg = tmp_keys
-    loop = make_hermes_loop(agent_pubkeys={
-        pairs["hermes"].public_key_hex.lower(),
-        pairs["chappy"].public_key_hex.lower(),
-    })
+    loop = make_hermes_loop()
     decide = AsyncMock(return_value="should not be called")
     monkeypatch.setattr(loop, "decide_reply", decide)
     publish = AsyncMock()
@@ -150,21 +237,22 @@ async def test_handle_event_skips_self_mention(tmp_keys, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_handle_event_skips_agent_to_agent(tmp_keys, monkeypatch):
+async def test_handle_event_skips_when_trigger_does_not_fire(tmp_keys, monkeypatch):
+    """chappy posts to @hermes but hermes's triggers must still allow it
+    (mentions=True).  Use a non-mention event to verify the trigger gate."""
     pairs, _ = tmp_keys
-    agent_pubs = {
-        pairs["hermes"].public_key_hex.lower(),
-        pairs["chappy"].public_key_hex.lower(),
-    }
-    loop = make_hermes_loop(agent_pubkeys=agent_pubs)
+    loop = make_hermes_loop()
+    # Override triggers to never fire.
+    loop.triggers = Triggers(mentions=False, keywords=[], all_messages=False)
+
     decide = AsyncMock(return_value="should not fire")
     monkeypatch.setattr(loop, "decide_reply", decide)
 
     ev = {
-        "id": "ev_a2a",
-        "pubkey": pairs["chappy"].public_key_hex,  # chappy is an agent
+        "id": "ev_notrigger",
+        "pubkey": pairs["wayne-observer"].public_key_hex,
         "kind": 9,
-        "content": "@hermes from chappy",
+        "content": "no @hermes here",
         "tags": [["h", "general"], ["p", pairs["hermes"].public_key_hex]],
     }
     await loop._handle_event(ev)
@@ -193,10 +281,9 @@ async def test_handle_event_skips_already_seen(tmp_keys, monkeypatch):
 @pytest.mark.asyncio
 async def test_handle_event_skips_during_cooldown(tmp_keys, monkeypatch):
     pairs, _ = tmp_keys
-    # Disable cooldown for this test
     loop = make_hermes_loop()
-    loop.reply_cooldown_seconds = 60.0  # huge cooldown
-    loop._last_reply_ts = time.time()   # just replied
+    loop.reply_cooldown_seconds = 60.0
+    loop._last_reply_ts = time.time()
 
     decide = AsyncMock(return_value="x")
     monkeypatch.setattr(loop, "decide_reply", decide)
@@ -234,12 +321,10 @@ async def test_handle_event_replies_to_principal(tmp_keys, monkeypatch):
     await loop._handle_event(ev)
     decide.assert_called_once()
     publish.assert_called_once()
-    # Reply should be threaded to the original event
     call = publish.call_args
     args, kwargs = call
-    # _publish_reply(channel, body, mentions=[...], reply_to=...)
     assert kwargs["reply_to"] == "ev_ok"
-    assert args[0] == "general"  # channel
+    assert args[0] == "general"
     assert kwargs["mentions"] == [pairs["wayne-observer"].public_key_hex.lower()]
     assert loop.dedupe.seen("ev_ok")
 
@@ -289,29 +374,28 @@ def test_dedupe_size_cap(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# Manager
+# Manager (factory-based, no `kind` field)
 # --------------------------------------------------------------------------- #
 
-def test_manager_builds_only_agent_loops(tmp_keys, monkeypatch):
-    """Manager should skip principals and unknown names."""
-    from agentchat.agents.manager import _build_loops, AGENT_FACTORIES
+def test_manager_builds_only_factored_loops(tmp_keys):
+    """Manager picks entries that have a factory (hermes, chappy).
+    wayne-observer has no factory → not built.  No `kind` field needed."""
+    from agentchat.agents.manager import _build_loops
     pairs, reg = tmp_keys
     loops = _build_loops()
     names = {l.name for l in loops}
-    # hermes + chappy are agents; wayne-observer is principal -> excluded
     assert "hermes" in names
     assert "chappy" in names
     assert "wayne-observer" not in names
 
 
-def test_manager_handles_missing_factory(tmp_keys):
-    """If a registry entry has kind=agent but no factory, skip with warning."""
+def test_manager_handles_unknown_registry_entry(tmp_keys):
+    """An entry without a factory is silently skipped."""
     from agentchat.agents import manager as mgr
     _, reg = tmp_keys
     reg["phantom"] = {
         "public_key_hex": "ff" * 32,
         "npub": "npub_phantom",
-        "kind": "agent",
     }
     reg_path = Path(os.environ["AGENTCHAT_NOSTR_DIR"]) / "registry.json"
     reg_path.write_text(json.dumps(reg))
