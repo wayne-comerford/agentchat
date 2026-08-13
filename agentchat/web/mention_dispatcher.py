@@ -84,8 +84,23 @@ def _load_registry() -> dict[str, dict]:
 
 
 def _reverse_registry(reg: dict[str, dict]) -> dict[str, str]:
-    """public_key_hex -> name"""
+    """public_key_hex -> name (for every entry in registry)."""
     return {info["public_key_hex"]: name for name, info in reg.items()}
+
+
+def _agent_pubkeys(reg: dict[str, dict]) -> set[str]:
+    """public_key_hex -> set of npubs marked kind=agent.
+
+    Agents reply to mentions.  Principals (humans / observers) do not.
+    External npubs not in the registry also do not.
+    """
+    out = set()
+    for name, info in reg.items():
+        if info.get("kind") == "agent":
+            pk = info.get("public_key_hex")
+            if pk:
+                out.add(pk.lower())
+    return out
 
 
 def _short_pubkey(pk_hex: str) -> str:
@@ -182,10 +197,17 @@ async def dispatch_once(
     relays: list[str],
     reg: dict[str, dict],
     pub_to_name: dict[str, str],
+    agent_pubs: set[str],
     dedupe: DedupeStore,
     signer_cache: dict[str, Any],
 ) -> int:
-    """Poll relay once, dispatch any new mentions. Returns count dispatched."""
+    """Poll relay once, dispatch any new mentions. Returns count dispatched.
+
+    Rule: an agent replies only if the message is from a NON-agent sender
+    (principal / human / external npub).  This breaks the agent-to-agent
+    ping-pong loop while still letting Wayne (or any other principal) talk
+    to agents directly.
+    """
     async with aiohttp.ClientSession() as session:
         events = await fetch_events(session)
 
@@ -203,10 +225,18 @@ async def dispatch_once(
         if not channel or not mentions:
             continue
 
+        # Skip agent-to-agent traffic to prevent infinite reply loops.
+        if sender in agent_pubs:
+            continue
+
         for target_pub in mentions:
             target_name = pub_to_name.get(target_pub)
             if not target_name:
-                continue  # not one of our agents
+                continue  # not one of our identities
+
+            # Only agents reply; principals don't auto-reply.
+            if target_pub not in agent_pubs:
+                continue
 
             # Skip self-mentions
             if target_pub == sender:
@@ -253,9 +283,14 @@ async def dispatch_once(
 async def _run() -> None:
     reg = _load_registry()
     pub_to_name = _reverse_registry(reg)
+    agent_pubs = _agent_pubkeys(reg)
     log.info(
         "dispatcher watching for mentions of: %s",
         ", ".join(sorted(pub_to_name.values())) or "(none)",
+    )
+    log.info(
+        "agents (auto-reply): %s",
+        ", ".join(sorted(pub_to_name[p] for p in agent_pubs)) or "(none)",
     )
     dedupe = DedupeStore(DEDUPE_PATH)
     signer_cache: dict[str, Any] = {}
@@ -275,6 +310,7 @@ async def _run() -> None:
                 relays=[RELAY_URL],
                 reg=reg,
                 pub_to_name=pub_to_name,
+                agent_pubs=agent_pubs,
                 dedupe=dedupe,
                 signer_cache=signer_cache,
             )

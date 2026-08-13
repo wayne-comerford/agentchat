@@ -37,9 +37,11 @@ def tmp_keys(tmp_path, monkeypatch):
         }))
         os.chmod(nostr / f"{name}.nsec.json", 0o600)
         pairs[name] = kp
+        # Mark first two as agents, third as principal (matches production schema).
         reg[name] = {
             "public_key_hex": kp.public_key_hex,
             "npub": kp.npub,
+            "kind": "agent" if name != "wayne-observer" else "principal",
         }
     (nostr / "registry.json").write_text(json.dumps(reg))
     return pairs, reg
@@ -316,10 +318,25 @@ def test_short_pubkey_format():
 
 
 def test_reverse_registry_maps_pubkey_to_name():
-    reg = {"alice": {"public_key_hex": "AA", "npub": "npub_a"}, "bob": {"public_key_hex": "BB", "npub": "npub_b"}}
+    reg = {"alice": {"public_key_hex": "AA", "npub": "npub_a", "kind": "agent"}, "bob": {"public_key_hex": "BB", "npub": "npub_b", "kind": "agent"}}
     rem = md._reverse_registry(reg)
     assert rem["AA"] == "alice"
     assert rem["BB"] == "bob"
+
+
+def test_agent_pubkeys_separates_agents_from_principals():
+    reg = {
+        "h": {"public_key_hex": "HH", "npub": "npub_h", "kind": "agent"},
+        "c": {"public_key_hex": "CC", "npub": "npub_c", "kind": "agent"},
+        "w": {"public_key_hex": "WW", "npub": "npub_w", "kind": "principal"},
+        "anon": {"public_key_hex": "AA"},  # no kind -> not an agent
+    }
+    pubs = md._agent_pubkeys(reg)
+    assert pubs == {"hh", "cc"}
+
+
+def test_agent_pubkeys_empty_when_no_kind():
+    assert md._agent_pubkeys({}) == set()
 
 
 # --------------------------------------------------------------------------- #
@@ -347,3 +364,147 @@ def test_dedupe_trims_to_5000_entries(tmp_path):
     assert s.seen("e5009:p5009")
     # Oldest entries dropped
     assert not s.seen("e0:p0")
+
+
+# --------------------------------------------------------------------------- #
+# Dispatcher routing rules (agent vs principal)
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.asyncio
+async def test_dispatch_skips_agent_to_agent_messages(tmp_keys, tmp_path, monkeypatch):
+    """Agent (hermes) -> @chappy must NOT trigger a chappy reply (loop prevention)."""
+    from agentchat.web.mention_dispatcher import dispatch_once, DedupeStore
+    pairs, reg = tmp_keys
+    agent_pubs = md._agent_pubkeys(reg)
+
+    events = [{
+        "id": "ev_agent_to_agent",
+        "pubkey": pairs["hermes"].public_key_hex,  # sender = agent
+        "kind": 9,
+        "created_at": 0,
+        "content": "@chappy hi",
+        "tags": [["h", "general"], ["p", pairs["chappy"].public_key_hex]],
+        "sig": "",
+    }]
+
+    # Monkeypatch fetch_events to return our test event
+    async def fake_fetch(session):
+        return events
+
+    monkeypatch.setattr(md, "fetch_events", fake_fetch)
+
+    # Spy on RelayPool to confirm it is never called
+    publish_called = {"count": 0}
+
+    class SpyPool:
+        def __init__(self, relays, keys):
+            pass
+        def publish_channel_message(self, **kw):
+            publish_called["count"] += 1
+            return "fake"
+    monkeypatch.setattr(md, "RelayPool", SpyPool)
+
+    dedupe = DedupeStore(tmp_path / "dedupe.json")
+    n = await dispatch_once(
+        relays=["ws://127.0.0.1:9876"],
+        reg=reg,
+        pub_to_name=md._reverse_registry(reg),
+        agent_pubs=agent_pubs,
+        dedupe=dedupe,
+        signer_cache={},
+    )
+    assert n == 0
+    assert publish_called["count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_dispatch_replies_when_principal_mentions_agent(tmp_keys, tmp_path, monkeypatch):
+    """Principal (wayne-observer) -> @chappy triggers exactly ONE chappy reply."""
+    from agentchat.web.mention_dispatcher import dispatch_once, DedupeStore
+    pairs, reg = tmp_keys
+    agent_pubs = md._agent_pubkeys(reg)
+
+    events = [{
+        "id": "ev_principal_to_agent",
+        "pubkey": pairs["wayne-observer"].public_key_hex,  # sender = principal
+        "kind": 9,
+        "created_at": 0,
+        "content": "@chappy hi from principal",
+        "tags": [["h", "general"], ["p", pairs["chappy"].public_key_hex]],
+        "sig": "",
+    }]
+
+    async def fake_fetch(session):
+        return events
+    monkeypatch.setattr(md, "fetch_events", fake_fetch)
+
+    published = []
+
+    class SpyPool:
+        def __init__(self, relays, keys):
+            self.signer = keys.public_key_hex
+        def publish_channel_message(self, channel_id, content, mentions=None):
+            published.append({"channel": channel_id, "content": content, "mentions": mentions, "by": self.signer})
+            return "fake"
+    monkeypatch.setattr(md, "RelayPool", SpyPool)
+
+    dedupe = DedupeStore(tmp_path / "dedupe.json")
+    n = await dispatch_once(
+        relays=["ws://127.0.0.1:9876"],
+        reg=reg,
+        pub_to_name=md._reverse_registry(reg),
+        agent_pubs=agent_pubs,
+        dedupe=dedupe,
+        signer_cache={},
+    )
+    assert n == 1
+    assert len(published) == 1
+    assert published[0]["by"] == pairs["chappy"].public_key_hex  # chappy signed
+    assert pairs["wayne-observer"].public_key_hex in published[0]["mentions"]
+
+
+@pytest.mark.asyncio
+async def test_dispatch_does_not_reply_to_principals(tmp_keys, tmp_path, monkeypatch):
+    """When @hermes is mentioned by wayne-observer, hermes DOES reply
+    (hermes is an agent).  But wayne-observer NEVER replies."""
+    from agentchat.web.mention_dispatcher import dispatch_once, DedupeStore
+    pairs, reg = tmp_keys
+    agent_pubs = md._agent_pubkeys(reg)
+
+    events = [{
+        "id": "ev_at_wayne",
+        "pubkey": pairs["hermes"].public_key_hex,  # sender = agent
+        "kind": 9,
+        "created_at": 0,
+        "content": "@wayne-observer check this",
+        "tags": [["h", "general"], ["p", pairs["wayne-observer"].public_key_hex]],
+        "sig": "",
+    }]
+
+    async def fake_fetch(session):
+        return events
+    monkeypatch.setattr(md, "fetch_events", fake_fetch)
+
+    published = []
+
+    class SpyPool:
+        def __init__(self, relays, keys):
+            pass
+        def publish_channel_message(self, **kw):
+            published.append(kw)
+            return "fake"
+    monkeypatch.setattr(md, "RelayPool", SpyPool)
+
+    dedupe = DedupeStore(tmp_path / "dedupe.json")
+    n = await dispatch_once(
+        relays=["ws://127.0.0.1:9876"],
+        reg=reg,
+        pub_to_name=md._reverse_registry(reg),
+        agent_pubs=agent_pubs,
+        dedupe=dedupe,
+        signer_cache={},
+    )
+    # wayne-observer is principal -> NOT in agent_pubs -> target skipped.
+    # Sender is agent -> whole message skipped.
+    assert n == 0
+    assert published == []
