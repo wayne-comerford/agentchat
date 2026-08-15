@@ -46,8 +46,11 @@ function workspace() {
       } catch (e) {
         console.error('boot failed', e);
       }
-      // Auto-select first channel
-      if (this.channels.length > 0) this.selectChannel(this.channels[0]);
+      // Auto-select: prefer #general (where the work happens), else first channel
+      if (this.channels.length > 0) {
+        const preferred = this.channels.find(c => c.id === 'general') || this.channels[0];
+        this.selectChannel(preferred);
+      }
     },
 
     // ─────────── auth ───────────
