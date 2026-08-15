@@ -43,12 +43,12 @@
 </head>
 
 <body
-  class="h-full font-sans antialiased"
+  class="h-screen overflow-hidden font-sans antialiased"
   x-data="workspace()"
   x-init="boot()"
 >
 
-  <div class="flex h-full">
+  <div class="flex h-screen overflow-hidden">
 
     <!-- ─────────────────────────── SIDEBAR ─────────────────────────── -->
     <aside class="w-64 bg-surface-800 border-r border-surface-700 flex flex-col">
@@ -61,7 +61,7 @@
       </div>
 
       <!-- Channels section -->
-      <nav class="flex-1 overflow-y-auto px-2 py-3">
+      <nav class="flex-1 min-h-0 overflow-y-auto px-2 py-3">
         <div class="px-3 py-1 text-xs font-semibold uppercase tracking-wider text-slate-500 flex items-center">
           Channels
         </div>
@@ -157,10 +157,10 @@
     </aside>
 
     <!-- ─────────────────────────── MAIN ─────────────────────────── -->
-    <main class="flex-1 flex flex-col bg-surface-900 min-w-0">
+    <main class="flex-1 min-h-0 flex flex-col bg-surface-900 min-w-0 overflow-hidden">
 
       <!-- Channel header -->
-      <header class="h-14 px-5 border-b border-surface-700 flex items-center bg-surface-800/60 backdrop-blur">
+      <header class="h-14 flex-none px-5 border-b border-surface-700 flex items-center bg-surface-800/60 backdrop-blur">
         <template x-if="activeChannel">
           <div class="flex items-center min-w-0">
             <span class="text-slate-500 mr-1">#</span>
@@ -192,13 +192,10 @@
             <span class="w-1.5 h-1.5 rounded-full bg-amber-400"></span>
             reconnecting…
           </span>
-        </div>
       </header>
 
       <!-- Message stream -->
-      <section
-        class="flex-1 overflow-y-auto px-5 py-4 space-y-3"
-        x-ref="stream"
+      <section class="flex-1 min-h-0 overflow-y-auto px-5 py-4 space-y-3" x-ref="stream"
         @scroll="onStreamScroll($event)"
       >
         <template x-if="!activeChannel && (!activeAgent || !activeAgent.name)">
@@ -240,7 +237,7 @@
       </section>
 
       <!-- Post box -->
-      <footer class="border-t border-surface-700 px-5 py-3 bg-surface-800/40">
+      <footer class="flex-none border-t border-surface-700 px-5 py-3 bg-surface-800/40">
         <template x-if="activeChannel">
           <form @submit.prevent="postMessage()" class="flex gap-2 items-start">
             <div class="flex-1 relative">
