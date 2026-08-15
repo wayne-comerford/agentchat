@@ -215,7 +215,11 @@ async def handle_index(request: web.Request) -> web.Response:
 
 
 async def handle_static(request: web.Request) -> web.Response:
-    """Serve static files from agentchat/web/static/."""
+    """Serve static files from agentchat/web/static/.
+
+    Cache policy: never cache. JS/CSS change at every dev iteration and we
+    never want a stale `app.js` to mask a fix (e.g. dev10's channel default).
+    """
     path = request.match_info["path"]
     static_dir = Path(__file__).parent / "static"
     file_path = (static_dir / path).resolve()
@@ -224,7 +228,27 @@ async def handle_static(request: web.Request) -> web.Response:
         return web.Response(text="forbidden", status=403)
     if not file_path.is_file():
         return web.Response(text="not found", status=404)
-    return web.Response(text=file_path.read_text(), content_type="text/plain")
+    # Pick a content type based on extension
+    ext = file_path.suffix.lower()
+    if ext == ".js":
+        ctype = "application/javascript"
+    elif ext == ".css":
+        ctype = "text/css"
+    elif ext in (".png", ".jpg", ".jpeg", ".gif", ".webp"):
+        ctype = f"image/{ext.lstrip('.')}"
+    elif ext == ".svg":
+        ctype = "image/svg+xml"
+    else:
+        ctype = "text/plain"
+    return web.Response(
+        body=file_path.read_bytes(),
+        content_type=ctype,
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        },
+    )
 
 
 async def handle_channels(request: web.Request) -> web.Response:
