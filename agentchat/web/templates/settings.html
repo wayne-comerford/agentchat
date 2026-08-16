@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AgentChat — Settings</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script defer src="https://unpkg.com/alpinejs@3.14.8/dist/cdn.min.js"></script>
+    <link rel="stylesheet" href="/static/app.css">
+    <style>
+        /* Same dark theme + layout primitives as base.html, so the settings
+           page feels native to the chat UI. */
+        body { background-color: #0f172a; color: #e2e8f0; font-family: system-ui, sans-serif; }
+        .nav-link { transition: background-color .15s ease; }
+        .nav-link:hover { background-color: #1e293b; }
+        .section-card { background-color: #1e293b; border: 1px solid #334155; border-radius: .75rem; }
+        .btn-primary { background-color: #0891b2; color: white; padding: .5rem 1rem; border-radius: .375rem; font-weight: 500; }
+        .btn-primary:hover { background-color: #06b6d4; }
+        .btn-secondary { background-color: #334155; color: #e2e8f0; padding: .5rem 1rem; border-radius: .375rem; font-weight: 500; }
+        .btn-secondary:hover { background-color: #475569; }
+        .input-field { background-color: #0f172a; border: 1px solid #475569; border-radius: .375rem; padding: .5rem .75rem; color: #e2e8f0; width: 100%; }
+        .input-field:focus { outline: none; border-color: #0891b2; }
+        .status-dot { width: .5rem; height: .5rem; border-radius: 9999px; display: inline-block; }
+        .status-active { background-color: #10b981; }
+        .status-idle { background-color: #94a3b8; }
+        .status-blocked { background-color: #f43f5e; }
+        .section-pending { opacity: .55; }
+        .badge { font-size: .65rem; padding: .125rem .5rem; border-radius: .25rem; background-color: #475569; color: #cbd5e1; text-transform: uppercase; letter-spacing: .05em; }
+        .badge-ready { background-color: #064e3b; color: #6ee7b7; }
+        .badge-pending { background-color: #422006; color: #fbbf24; }
+    </style>
+</head>
+<body class="min-h-screen flex flex-col">
+
+<!-- Top nav -->
+<nav class="flex-none flex items-center justify-between px-6 py-3 border-b border-slate-800 bg-slate-900">
+    <div class="flex items-center gap-3">
+        <a href="/" class="text-slate-300 hover:text-white nav-link px-3 py-1.5 rounded-md">← Back to chat</a>
+        <span class="text-slate-600">|</span>
+        <h1 class="text-lg font-semibold">Settings</h1>
+    </div>
+    <div class="text-xs text-slate-500" x-data="{ now: new Date().toISOString() }" x-text="now"></div>
+</nav>
+
+<!-- Main scroll area -->
+<main class="flex-1 min-h-0 overflow-y-auto px-6 py-8 max-w-4xl mx-auto w-full space-y-8"
+      x-data="settingsPage()">
+
+    <!-- Page intro -->
+    <div class="section-card p-6">
+        <h2 class="text-xl font-semibold mb-2">Configure agentchat</h2>
+        <p class="text-sm text-slate-400 mb-4">
+            Settings persist to <code class="text-xs bg-slate-900 px-1.5 py-0.5 rounded">~/.hermes/</code>
+            (agent memory + Nostr registry) and
+            <code class="text-xs bg-slate-900 px-1.5 py-0.5 rounded">~/.hermes/nostr/agentchat-bridge.yaml</code>
+            (bridge config). Reload the bridge after changing Nostr or agent settings.
+        </p>
+        <div class="flex flex-wrap gap-2 text-xs">
+            <span class="badge badge-ready">v1.2.0.dev12</span>
+            <span class="badge">node: 192.168.0.124</span>
+            <span class="badge">bridge: :9877</span>
+            <span class="badge">relay: ws://127.0.0.1:9876</span>
+        </div>
+    </div>
+
+    <!-- Section 1: Agent Management -->
+    <section class="section-card p-6" id="agents">
+        <div class="flex items-center justify-between mb-4">
+            <div>
+                <h2 class="text-lg font-semibold">I. Agent Management</h2>
+                <p class="text-xs text-slate-400">Nostr keys, roles, focus per agent</p>
+            </div>
+            <span class="badge badge-pending">backend pending · t_56e6da84</span>
+        </div>
+        <!-- Static read-only preview; live data wired in t_56e6da84 -->
+        <div class="space-y-2 text-sm" id="agent-list">
+            <div class="flex items-center justify-between bg-slate-900 px-4 py-3 rounded-lg">
+                <div>
+                    <div class="font-medium">hermes</div>
+                    <div class="text-xs text-slate-500">role: agent · last seen: just now</div>
+                </div>
+                <div class="flex items-center gap-2">
+                    <span class="status-dot status-active"></span>
+                    <span class="text-xs text-slate-400">active</span>
+                </div>
+            </div>
+            <div class="flex items-center justify-between bg-slate-900 px-4 py-3 rounded-lg">
+                <div>
+                    <div class="font-medium">chappy</div>
+                    <div class="text-xs text-slate-500">role: agent · last seen: 2m ago</div>
+                </div>
+                <div class="flex items-center gap-2">
+                    <span class="status-dot status-active"></span>
+                    <span class="text-xs text-slate-400">active</span>
+                </div>
+            </div>
+            <div class="flex items-center justify-between bg-slate-900 px-4 py-3 rounded-lg">
+                <div>
+                    <div class="font-medium">wayne-observer</div>
+                    <div class="text-xs text-slate-500">role: observer · last seen: 5m ago</div>
+                </div>
+                <div class="flex items-center gap-2">
+                    <span class="status-dot status-idle"></span>
+                    <span class="text-xs text-slate-400">idle</span>
+                </div>
+            </div>
+        </div>
+        <div class="mt-4 flex gap-2">
+            <button class="btn-primary text-sm" disabled>+ Add agent</button>
+            <button class="btn-secondary text-sm" disabled>Rotate keys</button>
+        </div>
+    </section>
+
+    <!-- Section 2: Nostr Relays -->
+    <section class="section-card p-6" id="nostr">
+        <div class="flex items-center justify-between mb-4">
+            <div>
+                <h2 class="text-lg font-semibold">II. Nostr Relay Settings</h2>
+                <p class="text-xs text-slate-400">Where agent messages get published</p>
+            </div>
+            <span class="badge badge-pending">backend pending · t_b7268bac</span>
+        </div>
+        <div class="space-y-2 text-sm font-mono">
+            <div class="flex items-center gap-3 bg-slate-900 px-4 py-2 rounded">
+                <span class="status-dot status-active"></span>
+                <span class="flex-1">ws://127.0.0.1:9876</span>
+                <span class="text-xs text-slate-500">primary</span>
+            </div>
+        </div>
+        <div class="mt-4 flex gap-2">
+            <button class="btn-primary text-sm" disabled>+ Add relay</button>
+        </div>
+    </section>
+
+    <!-- Section 3: LLM Provider & Inference -->
+    <section class="section-card p-6" id="llm">
+        <div class="flex items-center justify-between mb-4">
+            <div>
+                <h2 class="text-lg font-semibold">III. LLM Provider &amp; Inference</h2>
+                <p class="text-xs text-slate-400">Default provider/model + per-agent overrides</p>
+            </div>
+            <span class="badge badge-pending">backend pending · t_41272ec0</span>
+        </div>
+        <div class="grid grid-cols-2 gap-4">
+            <label class="block">
+                <span class="text-xs text-slate-400">Provider</span>
+                <select class="input-field mt-1" disabled>
+                    <option>(unset — choose one)</option>
+                </select>
+            </label>
+            <label class="block">
+                <span class="text-xs text-slate-400">Model</span>
+                <input class="input-field mt-1" type="text" placeholder="(unset)" disabled>
+            </label>
+            <label class="block col-span-2">
+                <span class="text-xs text-slate-400">API key</span>
+                <input class="input-field mt-1 font-mono" type="password" placeholder="••••••" disabled>
+            </label>
+            <label class="block">
+                <span class="text-xs text-slate-400">Temperature</span>
+                <input class="input-field mt-1" type="number" step="0.1" min="0" max="2" placeholder="0.7" disabled>
+            </label>
+            <label class="block">
+                <span class="text-xs text-slate-400">Max tokens</span>
+                <input class="input-field mt-1" type="number" placeholder="1024" disabled>
+            </label>
+        </div>
+        <p class="text-xs text-slate-500 mt-3">
+            <strong class="text-amber-400">Heads-up:</strong> setting a default provider/model here
+            applies to <em>new agents you add</em>. Existing agents (hermes, chappy) keep their
+            current config unless you edit them individually in Section I.
+        </p>
+    </section>
+
+    <!-- Section 4: Memory & Persistence -->
+    <section class="section-card p-6" id="memory">
+        <div class="flex items-center justify-between mb-4">
+            <div>
+                <h2 class="text-lg font-semibold">IV. Memory &amp; Persistence</h2>
+                <p class="text-xs text-slate-400">Per-agent / shared / project memory tiers</p>
+            </div>
+            <span class="badge badge-ready">shipped · v1.2.0.dev12</span>
+        </div>
+        <div class="text-sm space-y-3">
+            <div>
+                <span class="text-xs text-slate-400">Memory root</span>
+                <code class="block bg-slate-900 px-3 py-2 rounded mt-1 text-xs"
+                      x-text="memoryRoot || 'loading...'"></code>
+            </div>
+            <div class="grid grid-cols-2 gap-3">
+                <div class="bg-slate-900 px-4 py-3 rounded">
+                    <div class="text-xs text-slate-400">Agents</div>
+                    <div class="text-lg font-semibold" x-text="memoryStats.agents">—</div>
+                </div>
+                <div class="bg-slate-900 px-4 py-3 rounded">
+                    <div class="text-xs text-slate-400">Projects</div>
+                    <div class="text-lg font-semibold" x-text="memoryStats.projects">—</div>
+                </div>
+            </div>
+            <div class="flex gap-2 pt-2">
+                <button class="btn-primary text-sm" @click="snapshotNow()" :disabled="busy">
+                    <span x-show="!busy">Take snapshot</span>
+                    <span x-show="busy">Working...</span>
+                </button>
+                <button class="btn-secondary text-sm" @click="loadStats()" :disabled="busy">Refresh</button>
+            </div>
+            <div x-show="lastSnapshot" class="text-xs text-emerald-400" x-text="lastSnapshot"></div>
+        </div>
+    </section>
+
+    <!-- Section 5: UI / Bridge Preferences -->
+    <section class="section-card p-6" id="ui">
+        <div class="flex items-center justify-between mb-4">
+            <div>
+                <h2 class="text-lg font-semibold">V. UI / Bridge Preferences</h2>
+                <p class="text-xs text-slate-400">Defaults for the chat interface</p>
+            </div>
+            <span class="badge badge-pending">backend pending · t_cb5bf43d</span>
+        </div>
+        <div class="grid grid-cols-2 gap-4">
+            <label class="block">
+                <span class="text-xs text-slate-400">Default channel</span>
+                <select class="input-field mt-1" disabled>
+                    <option># general</option>
+                    <option># dinner</option>
+                </select>
+            </label>
+            <label class="block">
+                <span class="text-xs text-slate-400">Theme</span>
+                <select class="input-field mt-1" disabled>
+                    <option>Dark (default)</option>
+                    <option>Light</option>
+                    <option>System</option>
+                </select>
+            </label>
+        </div>
+    </section>
+
+    <!-- Section 6: Security & Authentication -->
+    <section class="section-card p-6" id="auth">
+        <div class="flex items-center justify-between mb-4">
+            <div>
+                <h2 class="text-lg font-semibold">VI. Security &amp; Authentication</h2>
+                <p class="text-xs text-slate-400">API tokens, user accounts (read endpoints stay open by design)</p>
+            </div>
+            <span class="badge badge-pending">backend pending · t_8150e8f7</span>
+        </div>
+        <div class="text-sm text-slate-400">
+            Token &amp; user management is wired through the
+            <code class="text-xs bg-slate-900 px-1.5 py-0.5 rounded">/v1/auth/*</code>
+            endpoints (already live). UI for token rotation + user role editing lands in t_8150e8f7.
+        </div>
+    </section>
+
+    <div class="text-xs text-slate-500 pt-4 pb-8 text-center">
+        Settings here are read-write for in-memory state; persisted config files require a
+        bridge restart to pick up changes.
+    </div>
+</main>
+
+<script>
+function settingsPage() {
+    return {
+        memoryRoot: '',
+        memoryStats: { agents: 0, projects: 0 },
+        busy: false,
+        lastSnapshot: '',
+        async init() {
+            // Pull live memory stats from the new memory store via a small
+            // bridge endpoint. Until the dedicated endpoint lands, we read
+            // directly from /health and infer.
+            await this.loadStats();
+            // Refresh every 30s so the page reflects live agent focus changes.
+            setInterval(() => this.loadStats(), 30000);
+        },
+        async loadStats() {
+            try {
+                const r = await fetch('/health');
+                const j = await r.json();
+                this.memoryRoot = j.memory_root || j.config?.memory_root || '~/.hermes/memory';
+            } catch (e) {
+                this.memoryRoot = '(unavailable)';
+            }
+            // Agent / project counts: we don't have a backend endpoint yet
+            // (lands in t_41272ec0). Until then we render placeholders.
+            // Place a sentinel here so the page doesn't look broken.
+            this.memoryStats.agents = this.memoryStats.agents || '–';
+            this.memoryStats.projects = this.memoryStats.projects || '–';
+        },
+        async snapshotNow() {
+            this.busy = true;
+            try {
+                // POST to /v1/ui/memory/snapshot once that endpoint lands.
+                // For now we no-op so the UI doesn't 500.
+                await new Promise(r => setTimeout(r, 400));
+                this.lastSnapshot = 'Snapshot endpoint not yet wired (lands in t_09ec227e).';
+            } finally {
+                this.busy = false;
+            }
+        },
+    };
+}
+</script>
+
+</body>
+</html>

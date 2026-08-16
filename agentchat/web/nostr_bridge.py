@@ -214,6 +214,17 @@ async def handle_index(request: web.Request) -> web.Response:
     )
 
 
+async def handle_settings(request: web.Request) -> web.Response:
+    """Render the settings page (system config + agent management)."""
+    html_path = Path(__file__).parent / "templates" / "settings.html"
+    if not html_path.exists():
+        return web.Response(text="settings.html not found", status=500)
+    return web.Response(
+        text=html_path.read_text(),
+        content_type="text/html",
+    )
+
+
 async def handle_static(request: web.Request) -> web.Response:
     """Serve static files from agentchat/web/static/.
 
@@ -598,6 +609,7 @@ def make_app(config: dict) -> web.Application:
     app.on_cleanup.append(on_cleanup)
 
     app.router.add_get("/", handle_index)
+    app.router.add_get("/settings", handle_settings)
     app.router.add_get("/health", handle_health)
     app.router.add_get("/static/{path:.*}", handle_static)
     app.router.add_get("/v1/ui/channels", handle_channels)
