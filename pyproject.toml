@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agentchat"
-version = "1.2.0.dev10"
+version = "1.2.0.dev12"
 description = "Agent-to-agent messaging bus: HTTP API + SSE + MCP. One server, many agents, one source of truth."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -41,9 +41,14 @@ s3 = [
 postgres = [
   "psycopg[binary]>=3.1",  # swap-in backend when AGENTCHAT_DB_URL is set
 ]
+telegram = [
+  # Optional Telegram bot bridge. Single dep, async-first, well maintained.
+  "python-telegram-bot>=21,<22",
+]
 
 [project.scripts]
 agentchat = "agentchat.__main__:main"
+agentchat-bot = "agentchat.bot.app:main"
 
 [project.urls]
 Homepage = "https://github.com/wayne-comerford/agentchat"

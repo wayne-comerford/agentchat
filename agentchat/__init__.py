@@ -73,7 +73,7 @@ LOG_PATH = AGENTCHAT_HOME / "server.log"
 
 DEFAULT_PORT = int(os.environ.get("AGENTCHAT_PORT", "7878"))
 DEFAULT_BIND = os.environ.get("AGENTCHAT_BIND", "0.0.0.0")
-SERVER_VERSION = "1.2.0.dev10"
+SERVER_VERSION = "1.2.0.dev12"
 
 MAX_BODY_BYTES = 64 * 1024  # 64 KiB per message
 THREAD_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_\-.]{0,63}$")
@@ -384,7 +384,81 @@ CREATE INDEX IF NOT EXISTS idx_audit_at ON audit_log(at);
 CREATE INDEX IF NOT EXISTS idx_audit_actor ON audit_log(actor);
 CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_log(action);
 CREATE INDEX IF NOT EXISTS idx_audit_target ON audit_log(target_type, target_id);
+
+-- v1.2 UI/Bridge preferences. One row per user; a row is created lazily on
+-- the user's first PUT (GET returns defaults without touching the table).
+--   user_id           : PK, references users.id; ON DELETE CASCADE so removing
+--                       a user drops their preferences automatically.
+--   default_channel_id: nullable text. NULL = no default channel selected.
+--                       References channels.id when the channels table ships;
+--                       kept as a free-form text column today so the schema
+--                       is forward-compatible with the upcoming channel feature.
+--   theme             : CHECK-constrained enum: 'light' | 'dark' | 'system'.
+--                       Default 'system' (OS-follow) so a freshly-installed
+--                       user gets the right look immediately.
+--   created_at / updated_at: ISO timestamps. updated_at is bumped on every
+--                       upsert via `WHERE updated_at = ?` so concurrent PUTs
+--                       never silently overwrite each other without trace.
+CREATE TABLE IF NOT EXISTS user_preferences (
+    user_id            INTEGER PRIMARY KEY,
+    default_channel_id TEXT,
+    theme              TEXT NOT NULL DEFAULT 'system'
+                       CHECK (theme IN ('light', 'dark', 'system')),
+    created_at         TEXT NOT NULL,
+    updated_at         TEXT NOT NULL,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
 """
+
+
+# --- v1.2 migrations ------------------------------------------------------ #
+#
+# Down-migrations live separately so `db_init()` stays fast (one
+# `executescript`) on the happy path. Operators who need to roll back
+# a specific feature can call `rollback_migration_<name>(conn)` explicitly.
+# Each migration function takes a connection (not a path) so callers stay
+# in control of the transaction boundary.
+
+# Up-migration for the v1.2 preferences feature. Kept as its own
+# CREATE TABLE IF NOT EXISTS block so apply_migration_preferences runs
+# in milliseconds even when the schema has grown to dozens of tables.
+# Mirrors the user_preferences block in SCHEMA above; keep them in sync.
+PREFERENCES_UP_SQL = """
+CREATE TABLE IF NOT EXISTS user_preferences (
+    user_id            INTEGER PRIMARY KEY,
+    default_channel_id TEXT,
+    theme              TEXT NOT NULL DEFAULT 'system'
+                       CHECK (theme IN ('light', 'dark', 'system')),
+    created_at         TEXT NOT NULL,
+    updated_at         TEXT NOT NULL,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+"""
+
+PREFERENCES_DOWN_SQL = """
+DROP TABLE IF EXISTS user_preferences;
+"""
+
+
+def apply_migration_preferences(conn) -> None:
+    """Create the v1.2 user_preferences table.
+
+    Idempotent: uses CREATE TABLE IF NOT EXISTS, so re-running on a fresh
+    DB or on a DB that already has the table is a no-op.
+
+    Args:
+        conn: An open sqlite3 connection (PRAGMAs already set by db_connect).
+    """
+    conn.executescript(PREFERENCES_UP_SQL)
+
+
+def rollback_migration_preferences(conn) -> None:
+    """Drop the v1.2 user_preferences table.
+
+    Idempotent: `DROP TABLE IF EXISTS`. Safe to run when the table never
+    existed (returns silently). Does NOT drop dependencies — none today.
+    """
+    conn.executescript(PREFERENCES_DOWN_SQL)
 
 
 def db_connect() -> sqlite3.Connection:
@@ -966,6 +1040,7 @@ VALID_AUDIT_ACTIONS = frozenset({
     "webhook_subscribe", "webhook_unsubscribe",
     "file_upload", "file_delete",
     "search", "export",
+    "memory_put", "memory_delete",
 })
 
 

@@ -25,11 +25,18 @@ import os
 import signal
 import time
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Optional
 
 import websockets
 
 from agentchat.agents.triggers import Triggers
+from agentchat.memory import (
+    FocusState,
+    read_agent as _mem_read_agent,
+    read_focus as _mem_read_focus,
+    read_team as _mem_read_team,
+    set_focus as _mem_set_focus,
+)
 from agentchat.nostr.events import build_channel_message
 from agentchat.nostr.keys import NostrKeys, load_keys
 
@@ -114,6 +121,37 @@ class ReplyLoop:
         self.subscribe_kinds = subscribe_kinds
         self._last_reply_ts: float = 0.0
         self._stop = asyncio.Event()
+        # Memory: load this agent's private facts + team focus on init.
+        # Subclasses can read self.memory / self.team_focus inside decide_reply.
+        self._memory_private: str = _mem_read_agent(self.name)
+        self._team_focus: FocusState = _mem_read_focus()
+        self._team_shared: str = _mem_read_team()
+
+    @property
+    def memory(self) -> str:
+        """This agent's private MEMORY.md (read-only snapshot at init time)."""
+        return self._memory_private
+
+    @property
+    def team_focus(self) -> FocusState:
+        """Structured team focus state (every agent's active focus + Wayne's priorities)."""
+        return self._team_focus
+
+    @property
+    def team_shared(self) -> str:
+        """Shared team SHARED.md content."""
+        return self._team_shared
+
+    def refresh_memory(self) -> None:
+        """Reload memory from disk. Call after long idle periods or when the
+        operator has updated the store while this loop is running."""
+        self._memory_private = _mem_read_agent(self.name)
+        self._team_focus = _mem_read_focus()
+        self._team_shared = _mem_read_team()
+
+    def set_focus(self, focus: str, *, status: str = "active", notes: str = "") -> None:
+        """Update this agent's focus in the shared store."""
+        self._team_focus = _mem_set_focus(self.name, focus=focus, status=status, notes=notes)
 
     # ----- subclass hook -----
     async def decide_reply(
@@ -132,6 +170,23 @@ class ReplyLoop:
 
     # ----- lifecycle -----
     async def run(self) -> None:
+        # Log loaded memory state so operators see what each loop knows.
+        my_focus = self._team_focus.agents.get(self.name)
+        if my_focus and my_focus.focus:
+            log.info("[%s] focus: %s [%s]", self.name, my_focus.focus, my_focus.status)
+        if self._team_focus.wayne_priorities:
+            log.info("[%s] wayne priorities: %s",
+                     self.name, " | ".join(self._team_focus.wayne_priorities))
+        others = [
+            f"{n}: {a.focus}" for n, a in self._team_focus.agents.items()
+            if n != self.name and a.focus
+        ]
+        if others:
+            log.info("[%s] team focus: %s", self.name, " | ".join(others))
+        if self._memory_private.strip():
+            log.info("[%s] private memory loaded: %d chars",
+                     self.name, len(self._memory_private))
+
         log.info("[%s] starting on %s", self.name, self.relay_url)
         backoff = 1.0
         while not self._stop.is_set():
