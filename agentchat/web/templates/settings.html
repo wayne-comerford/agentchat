@@ -205,6 +205,84 @@
                 <button class="btn-secondary text-sm" @click="loadStats()" :disabled="busy">Refresh</button>
             </div>
             <div x-show="lastSnapshot" class="text-xs text-emerald-400" x-text="lastSnapshot"></div>
+
+            <!-- Bootstrap: import memories for a new agent from an existing snapshot -->
+            <div class="mt-5 pt-5 border-t border-slate-700">
+                <div class="flex items-center justify-between mb-2">
+                    <h3 class="text-sm font-semibold">Import memories into a new agent</h3>
+                    <span class="badge badge-ready">shipped · v1.2.0.dev13</span>
+                </div>
+                <p class="text-xs text-slate-400 mb-3">
+                    Bring a new agent online with prior memories from a snapshot bundle or single-agent export dir.
+                    We always archive the live state first (unless you uncheck the box) so this is reversible.
+                </p>
+                <div class="grid grid-cols-1 gap-3">
+                    <label class="block">
+                        <span class="text-xs text-slate-400">Target agent name</span>
+                        <input type="text" class="input-field mt-1" x-model="importForm.agent"
+                               placeholder="e.g. wayne-researcher" pattern="[a-zA-Z0-9_-]+">
+                    </label>
+                    <label class="block">
+                        <span class="text-xs text-slate-400">Source (snapshot dir or export bundle)</span>
+                        <div class="flex gap-2 mt-1">
+                            <select class="input-field flex-1" x-model="importForm.source"
+                                    :disabled="!memorySources.length">
+                                <option value="">— pick a recent snapshot —</option>
+                                <template x-for="src in memorySources" :key="src.path">
+                                    <option :value="src.path"
+                                            x-text="`${src.name} (${src.agents} agent${src.agents === 1 ? '' : 's'})`"></option>
+                                </template>
+                            </select>
+                            <button type="button" class="btn-secondary text-xs"
+                                    @click="loadSources()" :disabled="busy">↻</button>
+                        </div>
+                        <input type="text" class="input-field mt-2 text-xs font-mono"
+                               x-model="importForm.source"
+                               placeholder="/absolute/path/to/bundle">
+                    </label>
+                    <div class="grid grid-cols-3 gap-3">
+                        <label class="block">
+                            <span class="text-xs text-slate-400">Mode</span>
+                            <select class="input-field mt-1" x-model="importForm.mode">
+                                <option value="merge">merge (append under sections)</option>
+                                <option value="replace">replace (overwrite target)</option>
+                            </select>
+                        </label>
+                        <label class="flex items-center gap-2 mt-5">
+                            <input type="checkbox" class="rounded" x-model="importForm.createIfMissing">
+                            <span class="text-xs">Create agent if missing</span>
+                        </label>
+                        <label class="flex items-center gap-2 mt-5">
+                            <input type="checkbox" class="rounded" x-model="importForm.noArchive">
+                            <span class="text-xs">Skip pre-import archive</span>
+                        </label>
+                    </div>
+                    <button class="btn-primary text-sm" @click="runImport()" :disabled="busy || !importForm.agent || !importForm.source">
+                        <span x-show="!busy">Import memories</span>
+                        <span x-show="busy">Working...</span>
+                    </button>
+                    <div x-show="importResult" class="text-xs"
+                         :class="importResult?.error ? 'text-rose-400' : 'text-emerald-400'">
+                        <template x-if="importResult && !importResult.error">
+                            <div>
+                                ✓ Imported <span x-text="importResult.files_imported?.length || 0"></span>
+                                file(s) into <code x-text="importResult.target_agent"></code>
+                                (mode: <span x-text="importResult.mode"></span>)
+                                <template x-if="importResult.archive">
+                                    <div class="text-slate-400 mt-1">
+                                        Archive: <code x-text="importResult.archive"></code>
+                                    </div>
+                                </template>
+                            </div>
+                        </template>
+                        <template x-if="importResult && importResult.error">
+                            <div>
+                                ✗ <span x-text="importResult.error"></span>
+                            </div>
+                        </template>
+                    </div>
+                </div>
+            </div>
         </div>
     </section>
 
@@ -265,11 +343,18 @@ function settingsPage() {
         memoryStats: { agents: 0, projects: 0 },
         busy: false,
         lastSnapshot: '',
+        memorySources: [],
+        importForm: {
+            agent: '',
+            source: '',
+            mode: 'merge',
+            createIfMissing: false,
+            noArchive: false,
+        },
+        importResult: null,
         async init() {
-            // Pull live memory stats from the new memory store via a small
-            // bridge endpoint. Until the dedicated endpoint lands, we read
-            // directly from /health and infer.
             await this.loadStats();
+            await this.loadSources();
             // Refresh every 30s so the page reflects live agent focus changes.
             setInterval(() => this.loadStats(), 30000);
         },
@@ -281,19 +366,74 @@ function settingsPage() {
             } catch (e) {
                 this.memoryRoot = '(unavailable)';
             }
-            // Agent / project counts: we don't have a backend endpoint yet
-            // (lands in t_41272ec0). Until then we render placeholders.
-            // Place a sentinel here so the page doesn't look broken.
-            this.memoryStats.agents = this.memoryStats.agents || '–';
-            this.memoryStats.projects = this.memoryStats.projects || '–';
+            // Real counts from the new memory store (live, not placeholder).
+            try {
+                const r = await fetch('/v1/ui/memory/sources');
+                if (r.ok) {
+                    const j = await r.json();
+                    this.memoryStats.agents = (j.sources || []).reduce(
+                        (acc, s) => Math.max(acc, s.agents), 0
+                    );
+                    // projects count is still a placeholder (no endpoint yet)
+                    this.memoryStats.projects = this.memoryStats.projects || '–';
+                }
+            } catch (e) {
+                this.memoryStats.agents = this.memoryStats.agents || '–';
+            }
+        },
+        async loadSources() {
+            try {
+                const r = await fetch('/v1/ui/memory/sources');
+                if (!r.ok) {
+                    this.memorySources = [];
+                    return;
+                }
+                const j = await r.json();
+                this.memorySources = j.sources || [];
+                if (!this.importForm.source && this.memorySources.length) {
+                    this.importForm.source = this.memorySources[0].path;
+                }
+            } catch (e) {
+                this.memorySources = [];
+            }
         },
         async snapshotNow() {
             this.busy = true;
+            this.lastSnapshot = '';
             try {
-                // POST to /v1/ui/memory/snapshot once that endpoint lands.
-                // For now we no-op so the UI doesn't 500.
-                await new Promise(r => setTimeout(r, 400));
-                this.lastSnapshot = 'Snapshot endpoint not yet wired (lands in t_09ec227e).';
+                // Until /v1/ui/memory/snapshot lands (t_09ec227e), we offer
+                // a manual link so users can run the CLI snapshot themselves.
+                this.lastSnapshot = 'Use the CLI for now: python -m agentchat.memory snapshot';
+            } finally {
+                this.busy = false;
+            }
+        },
+        async runImport() {
+            this.busy = true;
+            this.importResult = null;
+            try {
+                const r = await fetch('/v1/ui/memory/import', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    credentials: 'include',
+                    body: JSON.stringify({
+                        agent: this.importForm.agent,
+                        source: this.importForm.source,
+                        mode: this.importForm.mode,
+                        create_if_missing: this.importForm.createIfMissing,
+                        no_archive: this.importForm.noArchive,
+                    }),
+                });
+                const j = await r.json();
+                if (!r.ok) {
+                    this.importResult = { error: j.error || `HTTP ${r.status}` };
+                } else {
+                    this.importResult = j;
+                    // refresh stats after import
+                    await this.loadStats();
+                }
+            } catch (e) {
+                this.importResult = { error: String(e) };
             } finally {
                 this.busy = false;
             }

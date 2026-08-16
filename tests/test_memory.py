@@ -229,6 +229,129 @@ class TestCli:
         assert "hermes" in r.stdout
         assert "chappy" in r.stdout
 
+    # ----- `init` subcommand ------------------------------------------------
+
+    def test_cli_init_merges_into_existing_agent(self, memroot):
+        """init --agent NAME --import-from DIR merges prior MEMORY.md into
+        an existing agent's store under the same headings."""
+        # 1. Existing target agent with some prior knowledge.
+        memory.write_agent("newagent", "# newagent — Agent Memory\n\n## Prefs\nloves coffee\n")
+        # 2. Source export bundle from another agent.
+        bundle = memroot / "incoming-bundle"
+        (bundle / "agents" / "oldagent").mkdir(parents=True)
+        (bundle / "agents" / "oldagent" / "MEMORY.md").write_text(
+            "# oldagent — Agent Memory\n\n## Prefs\nprefers Python\n\n## Tools\nlikes vi\n",
+            encoding="utf-8",
+        )
+        r = _cli(
+            ["init", "--agent", "newagent", "--import-from", str(bundle),
+             "--no-archive"],
+            memroot,
+        )
+        assert r.returncode == 0, r.stderr + r.stdout
+        summary = json.loads(r.stdout)
+        assert summary["target_agent"] == "newagent"
+        assert summary["mode"] == "merge"
+        # merge → both prefs lines present
+        body = memory.read_agent("newagent")
+        assert "loves coffee" in body
+        assert "prefers Python" in body
+        assert "vi" in body
+
+    def test_cli_init_create_if_missing(self, memroot):
+        """--create-if-missing scaffolds an empty MEMORY.md then imports."""
+        assert "newagent2" not in memory.list_agents()
+        bundle = memroot / "incoming"
+        (bundle / "agents" / "source1").mkdir(parents=True)
+        (bundle / "agents" / "source1" / "MEMORY.md").write_text(
+            "# source1 — Memory\n\n## Role\nresearcher\n",
+            encoding="utf-8",
+        )
+        r = _cli(
+            ["init", "--agent", "newagent2", "--import-from", str(bundle),
+             "--create-if-missing", "--no-archive"],
+            memroot,
+        )
+        assert r.returncode == 0, r.stderr + r.stdout
+        assert "newagent2" in memory.list_agents()
+        body = memory.read_agent("newagent2")
+        assert "researcher" in body
+
+    def test_cli_init_without_create_fails(self, memroot):
+        """Without --create-if-missing and without an existing MEMORY.md,
+        init must exit 2 and not create anything."""
+        bundle = memroot / "incoming"
+        (bundle / "agents" / "source2").mkdir(parents=True)
+        (bundle / "agents" / "source2" / "MEMORY.md").write_text("x", encoding="utf-8")
+        r = _cli(
+            ["init", "--agent", "ghost", "--import-from", str(bundle),
+             "--no-archive"],
+            memroot,
+        )
+        assert r.returncode == 2
+        assert "ghost" not in memory.list_agents()
+
+    def test_cli_init_missing_source_fails(self, memroot):
+        memory.write_agent("newagent3", "# newagent3\n")
+        r = _cli(
+            ["init", "--agent", "newagent3", "--import-from",
+             str(memroot / "does-not-exist"), "--no-archive"],
+            memroot,
+        )
+        assert r.returncode == 2
+        assert "not found" in r.stderr.lower()
+
+    def test_cli_init_invalid_agent_name_fails(self, memroot):
+        bundle = memroot / "incoming"
+        bundle.mkdir(exist_ok=True)
+        r = _cli(
+            ["init", "--agent", "bad name with spaces", "--import-from",
+             str(bundle), "--no-archive"],
+            memroot,
+        )
+        assert r.returncode == 2
+
+    def test_cli_init_replace_mode_overwrites(self, memroot):
+        """mode=replace should overwrite the target tier with the source."""
+        memory.write_agent("newagent4", "# old\n\n## Prefs\nold pref\n")
+        bundle = memroot / "incoming"
+        (bundle / "agents" / "src").mkdir(parents=True)
+        (bundle / "agents" / "src" / "MEMORY.md").write_text(
+            "# fresh\n\n## Role\nonly this\n",
+            encoding="utf-8",
+        )
+        r = _cli(
+            ["init", "--agent", "newagent4", "--import-from", str(bundle),
+             "--mode", "replace", "--no-archive"],
+            memroot,
+        )
+        assert r.returncode == 0, r.stderr + r.stdout
+        body = memory.read_agent("newagent4")
+        assert "old pref" not in body
+        assert "only this" in body
+
+    def test_cli_init_default_creates_archive(self, memroot):
+        """Without --no-archive, init should produce an archive snapshot first."""
+        memory.write_agent("newagent5", "# newagent5\n\n## A\nfoo\n")
+        bundle = memroot / "incoming"
+        (bundle / "agents" / "src").mkdir(parents=True)
+        (bundle / "agents" / "src" / "MEMORY.md").write_text(
+            "# src\n\n## A\nbar\n",
+            encoding="utf-8",
+        )
+        r = _cli(
+            ["init", "--agent", "newagent5", "--import-from", str(bundle)],
+            memroot,
+        )
+        assert r.returncode == 0, r.stderr + r.stdout
+        summary = json.loads(r.stdout)
+        assert "archive" in summary
+        archive_path = Path(summary["archive"])
+        assert archive_path.exists()
+        # the archive should contain the pre-import state
+        archived = (archive_path / "agents" / "newagent5" / "MEMORY.md").read_text()
+        assert "foo" in archived
+
 
 # --------------------------------------------------------------------------- #
 # Markdown helpers

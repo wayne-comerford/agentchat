@@ -49,6 +49,7 @@ sys.path.insert(0, str(_REPO_ROOT))
 from agentchat.nostr.client import RelayPool  # noqa: E402
 from agentchat.nostr.events import build_channel_message  # noqa: E402
 from agentchat.nostr.keys import NostrKeys, load_keys  # noqa: E402
+from agentchat import memory as memory_store  # noqa: E402
 
 # Per-agent keypair registry (loaded lazily).
 # Path is overridable via AGENTCHAT_NOSTR_DIR for tests.
@@ -223,6 +224,124 @@ async def handle_settings(request: web.Request) -> web.Response:
         text=html_path.read_text(),
         content_type="text/html",
     )
+
+
+async def handle_memory_list_sources(request: web.Request) -> web.Response:
+    """GET /v1/ui/memory/sources — list recent snapshot dirs available to import.
+
+    Returns one entry per snapshot under ``memory_store.archive_dir()`` so
+    the /settings UI can populate a <select> for the "Import memories"
+    dropdown.  Limited to the 50 most recent (newest first).
+    """
+    try:
+        snaps = memory_store.list_snapshots()
+    except Exception as e:
+        log.warning("memory/sources failed: %s", e)
+        return web.json_response({"error": str(e)}, status=500)
+
+    out = []
+    for p in reversed(snaps[-50:]):
+        if not p.is_dir():
+            continue
+        # Heuristic: count how many MEMORY.md files are inside (one per agent).
+        try:
+            agent_count = sum(1 for _ in p.glob("agents/*/MEMORY.md"))
+        except Exception:
+            agent_count = 0
+        out.append({
+            "path": str(p),
+            "name": p.name,
+            "agents": agent_count,
+            "mtime": p.stat().st_mtime,
+        })
+    return web.json_response({"sources": out, "root": str(memory_store.memory_root())})
+
+
+async def handle_memory_import(request: web.Request) -> web.Response:
+    """POST /v1/ui/memory/import — bootstrap a new agent by importing memories.
+
+    Body: {
+      "agent": "<target agent name>",
+      "source": "<absolute path to a snapshot or export dir>",
+      "mode": "merge" | "replace",        # default "merge"
+      "create_if_missing": true|false,    # default false
+      "no_archive": true|false            # default false (we snapshot first)
+    }
+
+    Auth: requires a logged-in session (any local agent) — same rule as
+    /v1/ui/post.  We never let an anonymous request mutate memory state.
+    """
+    session_name = request.cookies.get(COOKIE_NAME)
+    if not session_name:
+        return web.json_response(
+            {"error": "login required"}, status=401
+        )
+
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON"}, status=400)
+
+    agent = (body.get("agent") or "").strip()
+    source = (body.get("source") or "").strip()
+    mode = body.get("mode", "merge")
+    create_if_missing = bool(body.get("create_if_missing", False))
+    no_archive = bool(body.get("no_archive", False))
+
+    if not agent:
+        return web.json_response({"error": "agent required"}, status=400)
+    if not source:
+        return web.json_response({"error": "source required"}, status=400)
+    if mode not in ("merge", "replace"):
+        return web.json_response({"error": "mode must be merge or replace"}, status=400)
+
+    src_path = Path(source)
+    if not src_path.is_absolute():
+        return web.json_response(
+            {"error": "source must be an absolute path"}, status=400
+        )
+    if not src_path.exists() or not src_path.is_dir():
+        return web.json_response(
+            {"error": f"source not found: {source}"}, status=400
+        )
+
+    # Validate agent name (mirrors memory._validate_agent rules).
+    if not agent.replace("-", "").replace("_", "").isalnum() or not agent:
+        return web.json_response(
+            {"error": f"invalid agent name: {agent!r}"}, status=400
+        )
+
+    target_path = memory_store.agent_memory_path(agent)
+    archive_path = None
+    try:
+        if not target_path.exists():
+            if not create_if_missing:
+                return web.json_response(
+                    {"error": f"target agent '{agent}' has no MEMORY.md — pass create_if_missing=true"},
+                    status=400,
+                )
+            memory_store.write_agent(agent, f"# {agent} — Agent Memory\n")
+        if not no_archive:
+            archive_path = memory_store.snapshot(
+                label=f"pre-import-{agent}"
+            )
+        summary = memory_store.import_memory(
+            src_path, target_agent=agent, mode=mode
+        )
+    except Exception as e:
+        log.warning("memory/import failed: agent=%s source=%s err=%s", agent, source, e)
+        return web.json_response({"error": str(e)}, status=500)
+
+    summary["target_agent"] = agent
+    summary["mode"] = mode
+    if archive_path is not None:
+        summary["archive"] = str(archive_path)
+    summary["imported_by"] = session_name
+    log.info(
+        "memory/import ok: agent=%s source=%s mode=%s by=%s files=%d",
+        agent, source, mode, session_name, len(summary.get("files_imported", [])),
+    )
+    return web.json_response(summary)
 
 
 async def handle_static(request: web.Request) -> web.Response:
@@ -615,6 +734,8 @@ def make_app(config: dict) -> web.Application:
     app.router.add_get("/v1/ui/channels", handle_channels)
     app.router.add_get("/v1/ui/agents", handle_agents)
     app.router.add_get("/v1/ui/stream", handle_stream)
+    app.router.add_get("/v1/ui/memory/sources", handle_memory_list_sources)
+    app.router.add_post("/v1/ui/memory/import", handle_memory_import)
     app.router.add_post("/v1/ui/post", handle_post)
     app.router.add_post("/v1/auth/login", handle_login)
     app.router.add_post("/v1/auth/logout", handle_logout)

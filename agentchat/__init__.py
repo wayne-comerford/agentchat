@@ -73,7 +73,7 @@ LOG_PATH = AGENTCHAT_HOME / "server.log"
 
 DEFAULT_PORT = int(os.environ.get("AGENTCHAT_PORT", "7878"))
 DEFAULT_BIND = os.environ.get("AGENTCHAT_BIND", "0.0.0.0")
-SERVER_VERSION = "1.2.0.dev12"
+SERVER_VERSION = "1.2.0.dev13"
 
 MAX_BODY_BYTES = 64 * 1024  # 64 KiB per message
 THREAD_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_\-.]{0,63}$")

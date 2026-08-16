@@ -681,6 +681,41 @@ def _cli(argv: list[str]) -> int:
     p_import.add_argument("--mode", choices=["merge", "replace"], default="merge")
     p_import.set_defaults(func=lambda a: _do_import(a))
 
+    # ----- `init` -----------------------------------------------------------
+    # Bring a new agent online with prior memories in one shot.  Takes a
+    # snapshot bundle (or single-agent export dir) and merges it under the
+    # agent's MEMORY.md.  Designed for the bootstrap flow that ships with
+    # t_fe4deb6d — used by both the bridge /v1/ui/memory/import endpoint
+    # and the "Import memories" button on /settings.
+    p_init = sub.add_parser(
+        "init",
+        help="bootstrap a new agent by importing prior memories from a bundle",
+    )
+    p_init.add_argument("--agent", required=True, help="target agent name")
+    p_init.add_argument(
+        "--import-from",
+        dest="source",
+        required=True,
+        help="path to a snapshot dir OR a single-agent export bundle",
+    )
+    p_init.add_argument(
+        "--mode",
+        choices=["merge", "replace"],
+        default="merge",
+        help="merge (default, append under existing sections) or replace (overwrite target tier)",
+    )
+    p_init.add_argument(
+        "--no-archive",
+        action="store_true",
+        help="skip the pre-import archive snapshot (default: snapshot live state first for safety)",
+    )
+    p_init.add_argument(
+        "--create-if-missing",
+        action="store_true",
+        help="create an empty MEMORY.md for the target agent before importing (default: fail if missing)",
+    )
+    p_init.set_defaults(func=lambda a: _do_init(a))
+
     args = p.parse_args(argv)
     return args.func(args)
 
@@ -770,8 +805,77 @@ def _do_import(args: argparse.Namespace) -> int:
     return 0
 
 
+def _do_init(args: argparse.Namespace) -> int:
+    """Bootstrap a new agent by importing prior memories.
+
+    Flow:
+      1. Validate target agent name + source path.
+      2. Optionally take an archive snapshot of live state first (safety net).
+      3. Create an empty MEMORY.md for the target agent if requested.
+      4. Delegate to ``import_memory(source, target_agent=..., mode=...)``.
+      5. Print a JSON summary with files imported and any archive path.
+
+    Exits 0 on success, 2 on validation error, 3 on import failure.
+    """
+    import sys
+
+    target_agent: str = args.agent
+    source: Path = Path(args.source)
+    mode: str = args.mode
+
+    # 1. validate target agent
+    try:
+        _validate_agent(target_agent)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+
+    # 2. validate source
+    if not source.exists() or not source.is_dir():
+        print(f"error: source not found or not a directory: {source}", file=sys.stderr)
+        return 2
+
+    # 3. create-if-missing
+    target_path = agent_memory_path(target_agent)
+    if not target_path.exists():
+        if not args.create_if_missing:
+            print(
+                f"error: target agent '{target_agent}' has no MEMORY.md. "
+                f"Pass --create-if-missing to bootstrap from empty, or "
+                f"use 'append' first to give the agent some context.",
+                file=sys.stderr,
+            )
+            return 2
+        write_agent(target_agent, f"# {target_agent} — Agent Memory\n")
+
+    # 4. optional archive
+    archive = None
+    if not args.no_archive:
+        archive = snapshot(label=f"pre-init-{target_agent}-{datetime.now(timezone.utc).strftime('%H%M%S')}")
+
+    # 5. delegate
+    try:
+        summary = import_memory(source, target_agent=target_agent, mode=mode)
+    except FileNotFoundError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 3
+    except Exception as e:
+        print(f"error: import failed: {e}", file=sys.stderr)
+        return 3
+
+    summary["target_agent"] = target_agent
+    summary["mode"] = mode
+    if archive is not None:
+        summary["archive"] = str(archive)
+    print(json.dumps(summary, indent=2))
+    return 0
+
+
 def main(argv: Optional[list[str]] = None) -> int:
-    return _cli(argv or [])
+    import sys
+    if argv is None:
+        argv = sys.argv[1:]
+    return _cli(argv)
 
 
 if __name__ == "__main__":
