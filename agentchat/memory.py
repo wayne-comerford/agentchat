@@ -149,6 +149,112 @@ def write_agent(name: str, content: str) -> None:
         atomic_write_text(p, content)
 
 
+def list_agent_sections(name: str) -> list[dict[str, Any]]:
+    """Return the agent's memory as a list of sections for the memory-UX UI.
+
+    Each section is ``{"title": str, "lines": [str, ...], "index": int}``.
+    Lines are stripped; blank lines are dropped.  Section ``index`` is the
+    stable order in the source markdown (used as ``:key`` for live editing).
+    The first H1 preamble (if any) is returned under title ``None`` so the
+    UI can render the agent display name + intro separately.
+    """
+    raw = read_agent(name)
+    parsed = _split_sections(raw)
+    sections: list[dict[str, Any]] = []
+    for idx, (title, body) in enumerate(parsed):
+        lines = [
+            stripped for stripped in (ln.strip() for ln in body.splitlines())
+            if stripped
+        ]
+        sections.append({"title": title, "lines": lines, "index": idx})
+    return sections
+
+
+def replace_agent_section(name: str, section_title: str, new_lines: list[str]) -> None:
+    """Replace the body of a single ``## section`` with ``new_lines``.
+
+    Lines are written verbatim (no extra escaping) so the UI controls
+    display/escape.  Creates the section if it doesn't already exist.
+    """
+    p = agent_memory_path(name)
+    with _file_lock(p):
+        existing = read_text(p)
+        # Reuse the merge helper: build a tiny incoming doc with just this
+        # section, then merge into the existing body.  That gives us
+        # "create-if-missing" behaviour for free and keeps the rest of the
+        # document intact.
+        incoming = f"## {section_title}\n" + "\n".join(new_lines) + "\n"
+        # Replace this section's body by removing existing section, then
+        # appending under-section.  Simpler: use _append_under_section for
+        # empty body, then write_agent the result.  But append creates
+        # duplicate lines on repeated calls — instead, build fresh content.
+        new_md = _replace_section_in_md(existing, section_title, new_lines)
+        atomic_write_text(p, new_md)
+
+
+def _replace_section_in_md(md: str, section_title: str, new_lines: list[str]) -> str:
+    """Return ``md`` with ``## section_title`` body replaced by ``new_lines``.
+
+    Creates the section if absent.  Preserves H1 preamble and other
+    sections untouched.  Lines are joined with single newlines; trailing
+    newline added so the file ends cleanly.
+    """
+    if not md.strip():
+        return f"## {section_title}\n" + "\n".join(new_lines) + "\n"
+
+    # Find the H2 for this title.
+    h2_pat = re.compile(r"^##\s+(.+?)\s*$", re.MULTILINE)
+    matches = list(h2_pat.finditer(md))
+    target_idx = None
+    target_match = None
+    for i, m in enumerate(matches):
+        if m.group(1).strip().lower() == section_title.strip().lower():
+            target_idx = i
+            target_match = m
+            break
+
+    if target_match is None:
+        # Section doesn't exist — append at end.
+        new_block = f"\n## {section_title}\n\n" + "\n".join(new_lines) + "\n"
+        if not md.endswith("\n"):
+            md = md + "\n"
+        return md + new_block
+
+    # Replace body of target section: from end of heading line to start of next H2 (or EOF).
+    body_start = target_match.end()
+    if target_match is None:
+        return md
+    if target_idx is None:
+        return md
+    if target_idx + 1 < len(matches):
+        body_end = matches[target_idx + 1].start()
+    else:
+        body_end = len(md)
+
+    new_body = "\n" + "\n".join(new_lines) + "\n\n" if new_lines else "\n"
+    return md[:body_start] + new_body + md[body_end:]
+
+
+def remove_agent_line(name: str, section_title: str, line_index: int) -> bool:
+    """Delete one line (by index) from ``## section_title``.
+
+    Returns True if a line was removed, False if the section or line
+    didn't exist.  Indexes are 0-based and refer to the order in
+    ``list_agent_sections(name)``.
+    """
+    sections = list_agent_sections(name)
+    section = next(
+        (s for s in sections
+         if s["title"] is not None and s["title"].strip().lower() == section_title.strip().lower()),
+        None,
+    )
+    if section is None or line_index >= len(section["lines"]):
+        return False
+    new_lines = [ln for i, ln in enumerate(section["lines"]) if i != line_index]
+    replace_agent_section(name, section_title, new_lines)
+    return True
+
+
 def append_agent(name: str, section: str, line: str) -> None:
     """Append ``line`` under a Markdown ``## section`` heading.
 
@@ -584,7 +690,8 @@ def _split_sections(md: str) -> list[tuple[Optional[str], str]]:
     """Split markdown into (heading-or-None, body) pairs.
 
     The first H1 (if any) is returned as the leading ``(title, body)`` pair
-    where ``body`` is the intro text up to the first H2.
+    where ``body`` is the intro text up to the first H2 (or the rest of
+    the document if there are no H2 sections).
     """
     if not md.strip():
         return []
@@ -592,7 +699,10 @@ def _split_sections(md: str) -> list[tuple[Optional[str], str]]:
     # Find all H2 boundaries.
     h2_matches = list(_H2_RE.finditer(md))
     if not h2_matches:
-        # Whole thing is a pre-section preamble.
+        # No H2 — extract the H1 if present, otherwise the whole thing.
+        h1_match = _H1_RE.search(md)
+        if h1_match:
+            return [(h1_match.group(1), md[h1_match.end():].lstrip("\n").rstrip("\n"))]
         return [(None, md.rstrip() + "\n")]
 
     sections = []

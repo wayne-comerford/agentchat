@@ -24,6 +24,19 @@ function workspace() {
     mentionQuery: '',
     eventSource: null,
 
+    // ─────────── Memories drawer ───────────
+    memoriesOpen: false,
+    memories: {
+      loading: false,
+      agents: [],
+      collapsed: {},          // "agent::section" → bool
+      editing: {},            // "agent::section::idx" → bool
+      addingLineFor: null,    // "agent::section"
+      addingSectionFor: null, // "agent"
+      draft: '',              // shared draft buffer (edit/add)
+      toast: null,            // { kind: 'ok'|'error', text: '' }
+    },
+
     // ─────────── bootstrap ───────────
     async boot() {
       try {
@@ -271,6 +284,188 @@ function workspace() {
       }
       const hue = Math.abs(h) % 360;
       return `hsl(${hue}, 55%, 45%)`;
+    },
+
+    // ─────────── Memories drawer methods ───────────
+    toggleMemories() {
+      this.memoriesOpen = !this.memoriesOpen;
+      if (this.memoriesOpen && (!this.memories.agents || this.memories.agents.length === 0)) {
+        this.loadMemories();
+      }
+    },
+
+    async loadMemories() {
+      this.memories.loading = true;
+      try {
+        const r = await fetch('/v1/ui/memory/agents', { credentials: 'same-origin' });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const j = await r.json();
+        this.memories.agents = j.agents || [];
+      } catch (e) {
+        this.toast('error', `Load failed: ${e.message || e}`);
+        this.memories.agents = [];
+      } finally {
+        this.memories.loading = false;
+      }
+    },
+
+    toggleSection(agentName, sectionTitle) {
+      const key = `${agentName}-${sectionTitle}`;
+      this.memories.collapsed[key] = !this.memories.collapsed[key];
+    },
+
+    startEdit(agentName, sectionTitle, idx, currentLine) {
+      const key = `${agentName}-${sectionTitle}-${idx}`;
+      this.memories.editing[key] = true;
+      this.memories.draft = currentLine;
+    },
+
+    cancelEdit() {
+      this.memories.editing = {};
+      this.memories.draft = '';
+    },
+
+    async commitEdit(agentName, sectionTitle, idx) {
+      const editKey = `${agentName}-${sectionTitle}-${idx}`;
+      const newLine = (this.memories.draft || '').trim();
+      const oldLine = this._findLine(agentName, sectionTitle, idx);
+      if (!newLine) {
+        this.toast('error', 'Line cannot be empty');
+        return;
+      }
+      if (newLine === oldLine) {
+        this.cancelEdit();
+        return;
+      }
+      // Strategy: PUT the whole section with the edited line swapped in.
+      const allLines = this._getSectionLines(agentName, sectionTitle).map((ln, i) =>
+        i === idx ? newLine : ln
+      );
+      try {
+        const r = await fetch(
+          `/v1/ui/memory/agents/${encodeURIComponent(agentName)}/sections/${encodeURIComponent(sectionTitle)}`,
+          {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'include',
+            body: JSON.stringify({ lines: allLines }),
+          }
+        );
+        const j = await r.json();
+        if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
+        this.cancelEdit();
+        await this.loadMemories();
+        this.toast('ok', `Updated ${agentName} · ${sectionTitle}`);
+      } catch (e) {
+        this.toast('error', `Edit failed: ${e.message || e}`);
+      }
+    },
+
+    async removeLine(agentName, sectionTitle, idx) {
+      const allLines = this._getSectionLines(agentName, sectionTitle);
+      if (idx >= allLines.length) return;
+      const newLines = allLines.filter((_, i) => i !== idx);
+      try {
+        const r = await fetch(
+          `/v1/ui/memory/agents/${encodeURIComponent(agentName)}/sections/${encodeURIComponent(sectionTitle)}`,
+          {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'include',
+            body: JSON.stringify({ lines: newLines }),
+          }
+        );
+        const j = await r.json();
+        if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
+        await this.loadMemories();
+        this.toast('ok', `Removed line from ${agentName}`);
+      } catch (e) {
+        this.toast('error', `Remove failed: ${e.message || e}`);
+      }
+    },
+
+    addLinePrompt(agentName, sectionTitle) {
+      this.memories.addingLineFor = `${agentName}::${sectionTitle}`;
+      this.memories.draft = '';
+    },
+
+    async commitAddLine(agentName, sectionTitle) {
+      const line = (this.memories.draft || '').trim();
+      if (!line) {
+        this.toast('error', 'Line cannot be empty');
+        return;
+      }
+      try {
+        const r = await fetch(
+          `/v1/ui/memory/agents/${encodeURIComponent(agentName)}/sections/${encodeURIComponent(sectionTitle)}/lines`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'include',
+            body: JSON.stringify({ line }),
+          }
+        );
+        const j = await r.json();
+        if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
+        this.memories.addingLineFor = null;
+        this.memories.draft = '';
+        await this.loadMemories();
+        this.toast('ok', `Added line to ${agentName}`);
+      } catch (e) {
+        this.toast('error', `Add failed: ${e.message || e}`);
+      }
+    },
+
+    async commitAddSection(agentName) {
+      const title = (this.memories.draft || '').trim();
+      if (!title) {
+        this.toast('error', 'Section name cannot be empty');
+        return;
+      }
+      try {
+        const r = await fetch(
+          `/v1/ui/memory/agents/${encodeURIComponent(agentName)}/sections/${encodeURIComponent(title)}`,
+          {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'include',
+            body: JSON.stringify({ lines: [] }),
+          }
+        );
+        const j = await r.json();
+        if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
+        this.memories.addingSectionFor = null;
+        this.memories.draft = '';
+        await this.loadMemories();
+        this.toast('ok', `Created section "${title}" for ${agentName}`);
+      } catch (e) {
+        this.toast('error', `Create section failed: ${e.message || e}`);
+      }
+    },
+
+    // ── helpers ──
+    _findLine(agentName, sectionTitle, idx) {
+      const lines = this._getSectionLines(agentName, sectionTitle);
+      return lines[idx] || '';
+    },
+
+    _getSectionLines(agentName, sectionTitle) {
+      const agent = (this.memories.agents || []).find(a => a.name === agentName);
+      if (!agent) return [];
+      const section = (agent.sections || []).find(
+        s => (s.title || '(intro)') === (sectionTitle || '(intro)')
+      );
+      return section ? [...(section.lines || [])] : [];
+    },
+
+    toast(kind, text) {
+      this.memories.toast = { kind, text };
+      setTimeout(() => {
+        // Only clear if it's still this toast (avoid races).
+        if (this.memories.toast && this.memories.toast.text === text) {
+          this.memories.toast = null;
+        }
+      }, 3000);
     },
   };
 }

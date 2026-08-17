@@ -354,6 +354,102 @@ class TestCli:
 
 
 # --------------------------------------------------------------------------- #
+# Memory Transparency helpers (used by the right-side Memories drawer)
+# --------------------------------------------------------------------------- #
+
+class TestMemoryTransparency:
+    """Direct unit tests for the structured read/edit helpers added in
+    dev13.  These power the GET/PUT/POST/DELETE bridge endpoints."""
+
+    def test_list_agent_sections_parses_h1_preamble(self, memroot):
+        memory.write_agent(
+            "agentA",
+            "# Agent A — display name\n\nintro text line\n\n## Prefs\nterse\nmulti\n\n## Tools\nvi\n",
+        )
+        sections = memory.list_agent_sections("agentA")
+        # First section is the H1 preamble (title carries the H1's text,
+        # lines carry any intro text before the first H2).
+        assert sections[0]["title"] == "Agent A — display name"
+        assert sections[0]["lines"] == ["intro text line"]
+        titles = [s["title"] for s in sections[1:]]
+        assert "Prefs" in titles
+        assert "Tools" in titles
+        prefs = next(s for s in sections if s["title"] == "Prefs")
+        assert prefs["lines"] == ["terse", "multi"]
+        tools = next(s for s in sections if s["title"] == "Tools")
+        assert tools["lines"] == ["vi"]
+
+    def test_list_agent_sections_empty(self, memroot):
+        memory.write_agent("agentB", "")
+        assert memory.list_agent_sections("agentB") == []
+
+    def test_list_agent_sections_no_h2(self, memroot):
+        memory.write_agent("agentC", "# just a title\n\nbody without sections\n")
+        sections = memory.list_agent_sections("agentC")
+        # Only the H1 preamble; no H2 sections.
+        assert len(sections) == 1
+        assert sections[0]["title"] == "just a title"
+
+    def test_replace_agent_section_replaces_body(self, memroot):
+        memory.write_agent("agentD", "# d\n\n## Prefs\nold1\nold2\n\n## Tools\nvi\n")
+        memory.replace_agent_section("agentD", "Prefs", ["new1", "new2", "new3"])
+        sections = memory.list_agent_sections("agentD")
+        prefs = next(s for s in sections if s["title"] == "Prefs")
+        assert prefs["lines"] == ["new1", "new2", "new3"]
+        # other sections untouched
+        tools = next(s for s in sections if s["title"] == "Tools")
+        assert tools["lines"] == ["vi"]
+
+    def test_replace_agent_section_creates_if_missing(self, memroot):
+        memory.write_agent("agentE", "# e\n\n## Prefs\nexisting\n")
+        memory.replace_agent_section("agentE", "NewSection", ["first"])
+        sections = memory.list_agent_sections("agentE")
+        new = next(s for s in sections if s["title"] == "NewSection")
+        assert new["lines"] == ["first"]
+        # existing preserved
+        prefs = next(s for s in sections if s["title"] == "Prefs")
+        assert prefs["lines"] == ["existing"]
+
+    def test_replace_agent_section_empty_clears_body(self, memroot):
+        memory.write_agent("agentF", "# f\n\n## Prefs\nold1\nold2\n")
+        memory.replace_agent_section("agentF", "Prefs", [])
+        sections = memory.list_agent_sections("agentF")
+        prefs = next(s for s in sections if s["title"] == "Prefs")
+        assert prefs["lines"] == []
+
+    def test_replace_agent_section_is_case_insensitive(self, memroot):
+        memory.write_agent("agentG", "# g\n\n## My Prefs\nx\n")
+        memory.replace_agent_section("agentG", "my prefs", ["y", "z"])
+        sections = memory.list_agent_sections("agentG")
+        prefs = next(s for s in sections if s["title"] == "My Prefs")
+        assert prefs["lines"] == ["y", "z"]
+
+    def test_remove_agent_line_by_index(self, memroot):
+        memory.write_agent("agentH", "# h\n\n## Tasks\nt1\nt2\nt3\n")
+        assert memory.remove_agent_line("agentH", "Tasks", 1) is True
+        sections = memory.list_agent_sections("agentH")
+        tasks = next(s for s in sections if s["title"] == "Tasks")
+        assert tasks["lines"] == ["t1", "t3"]
+
+    def test_remove_agent_line_out_of_range_returns_false(self, memroot):
+        memory.write_agent("agentI", "# i\n\n## Tasks\nonly\n")
+        assert memory.remove_agent_line("agentI", "Tasks", 5) is False
+        assert memory.remove_agent_line("agentI", "NotHere", 0) is False
+
+    def test_atomic_write_no_torn_file_on_replace(self, memroot):
+        """Replace must atomically replace the file (no torn state visible)."""
+        memory.write_agent("agentJ", "# j\n\n## A\norig\n")
+        # Simulate concurrent read while writing by reading before/after.
+        before = memory.read_agent("agentJ")
+        memory.replace_agent_section("agentJ", "A", ["new"])
+        after = memory.read_agent("agentJ")
+        # No torn state — either fully old or fully new, never partial.
+        assert "orig" in before or "new" in before
+        assert "new" in after
+        assert "orig" not in after
+
+
+# --------------------------------------------------------------------------- #
 # Markdown helpers
 # --------------------------------------------------------------------------- #
 

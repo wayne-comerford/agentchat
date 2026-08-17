@@ -344,6 +344,134 @@ async def handle_memory_import(request: web.Request) -> web.Response:
     return web.json_response(summary)
 
 
+# --------------------------------------------------------------------------- #
+# Memory Transparency — per-agent structured read/edit endpoints
+# (powers the right-side Memories drawer in the chat UI)
+# --------------------------------------------------------------------------- #
+
+async def handle_memory_list_agents(request: web.Request) -> web.Response:
+    """GET /v1/ui/memory/agents — all agents + structured sections.
+
+    Returns::
+
+        {
+          "agents": [
+            {"name": "hermes", "sections": [{"title": "Prefs", "lines": [...], "index": 1}, ...]},
+            ...
+          ]
+        }
+
+    Public read access — anyone can see what an agent remembers.  This
+    matches the existing chat model (channels + messages are also public).
+    """
+    agents_out: list[dict[str, Any]] = []
+    for name in memory_store.list_agents():
+        try:
+            sections = memory_store.list_agent_sections(name)
+        except Exception as e:
+            log.warning("memory sections read failed for %s: %s", name, e)
+            sections = []
+        agents_out.append({"name": name, "sections": sections})
+    return web.json_response({"agents": agents_out})
+
+
+async def handle_memory_get_agent(request: web.Request) -> web.Response:
+    """GET /v1/ui/memory/agents/{name} — single agent's structured sections."""
+    name = request.match_info["name"]
+    try:
+        memory_store._validate_agent(name)
+    except ValueError as e:
+        return web.json_response({"error": str(e)}, status=400)
+    try:
+        sections = memory_store.list_agent_sections(name)
+    except FileNotFoundError:
+        return web.json_response({"error": f"agent not found: {name}"}, status=404)
+    return web.json_response({"name": name, "sections": sections})
+
+
+async def handle_memory_append_line(request: web.Request) -> web.Response:
+    """POST /v1/ui/memory/agents/{name}/sections/{section}/lines
+
+    Body: ``{"line": "<text>"}``.  Appends one line to the named section
+    (creates the section if missing).  Session-required.
+    """
+    name = request.match_info["name"]
+    section = request.match_info["section"]
+    if not request.cookies.get(COOKIE_NAME):
+        return web.json_response({"error": "login required"}, status=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON"}, status=400)
+    line = (body.get("line") or "").strip()
+    if not line:
+        return web.json_response({"error": "line required"}, status=400)
+    try:
+        memory_store._validate_agent(name)
+    except ValueError as e:
+        return web.json_response({"error": str(e)}, status=400)
+    try:
+        memory_store.append_agent(name, section, line)
+    except FileNotFoundError:
+        memory_store.write_agent(name, f"# {name} — Agent Memory\n")
+        memory_store.append_agent(name, section, line)
+    return web.json_response({"ok": True, "name": name, "section": section, "line": line})
+
+
+async def handle_memory_delete_line(request: web.Request) -> web.Response:
+    """DELETE /v1/ui/memory/agents/{name}/sections/{section}/lines/{idx}
+
+    Removes one line by 0-based index.  Session-required.
+    """
+    name = request.match_info["name"]
+    section = request.match_info["section"]
+    idx_str = request.match_info["idx"]
+    if not request.cookies.get(COOKIE_NAME):
+        return web.json_response({"error": "login required"}, status=401)
+    try:
+        idx = int(idx_str)
+    except ValueError:
+        return web.json_response({"error": "idx must be integer"}, status=400)
+    try:
+        memory_store._validate_agent(name)
+    except ValueError as e:
+        return web.json_response({"error": str(e)}, status=400)
+    removed = memory_store.remove_agent_line(name, section, idx)
+    if not removed:
+        return web.json_response({"error": "section/line not found"}, status=404)
+    return web.json_response({"ok": True, "name": name, "section": section, "removed_index": idx})
+
+
+async def handle_memory_replace_section(request: web.Request) -> web.Response:
+    """PUT /v1/ui/memory/agents/{name}/sections/{section}
+
+    Body: ``{"lines": ["<line1>", "<line2>", ...]}``.  Replaces the entire
+    body of a section.  Creates the section if missing.  Session-required.
+    """
+    name = request.match_info["name"]
+    section = request.match_info["section"]
+    if not request.cookies.get(COOKIE_NAME):
+        return web.json_response({"error": "login required"}, status=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON"}, status=400)
+    lines = body.get("lines")
+    if not isinstance(lines, list):
+        return web.json_response({"error": "lines must be a list"}, status=400)
+    lines = [str(ln) for ln in lines]
+    try:
+        memory_store._validate_agent(name)
+    except ValueError as e:
+        return web.json_response({"error": str(e)}, status=400)
+    try:
+        memory_store.replace_agent_section(name, section, lines)
+    except FileNotFoundError:
+        memory_store.write_agent(name, f"# {name} — Agent Memory\n")
+        memory_store.replace_agent_section(name, section, lines)
+    return web.json_response({"ok": True, "name": name, "section": section, "lines": lines})
+
+
 async def handle_static(request: web.Request) -> web.Response:
     """Serve static files from agentchat/web/static/.
 
@@ -735,6 +863,11 @@ def make_app(config: dict) -> web.Application:
     app.router.add_get("/v1/ui/agents", handle_agents)
     app.router.add_get("/v1/ui/stream", handle_stream)
     app.router.add_get("/v1/ui/memory/sources", handle_memory_list_sources)
+    app.router.add_get("/v1/ui/memory/agents", handle_memory_list_agents)
+    app.router.add_get("/v1/ui/memory/agents/{name}", handle_memory_get_agent)
+    app.router.add_post("/v1/ui/memory/agents/{name}/sections/{section}/lines", handle_memory_append_line)
+    app.router.add_delete("/v1/ui/memory/agents/{name}/sections/{section}/lines/{idx}", handle_memory_delete_line)
+    app.router.add_put("/v1/ui/memory/agents/{name}/sections/{section}", handle_memory_replace_section)
     app.router.add_post("/v1/ui/memory/import", handle_memory_import)
     app.router.add_post("/v1/ui/post", handle_post)
     app.router.add_post("/v1/auth/login", handle_login)
