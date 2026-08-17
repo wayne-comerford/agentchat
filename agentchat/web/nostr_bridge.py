@@ -731,11 +731,41 @@ async def handle_stream(request: web.Request) -> web.StreamResponse:
     we'll need a proper WS bridge (Slice 1.5 work).
 
     Filters: only events where kind==9 AND the #h tag equals the channel id.
+
+    Reconnect: supports Last-Event-ID header (or ``?since=<unix-ts>`` query
+    param) — replays events whose ``created_at`` is >= the supplied cutoff
+    so a client that reconnects doesn't miss messages buffered while it was
+    gone.  Each event is emitted with an ``id: <event_id>`` line so a
+    browser EventSource can resume cleanly on automatic reconnect.
     """
     state = get_state(request.app)
     channel = request.query.get("channel", "").strip()
     if not channel:
         return web.json_response({"error": "channel required"}, status=400)
+
+    # Resolve the resume cutoff.  Last-Event-ID header takes precedence
+    # over ?since= (matches the SSE spec).  We treat the id as a Nostr
+    # event id and resolve it via the relay to the event's created_at;
+    # fall back to the raw header as a unix timestamp if it isn't hex.
+    since_ts: int | None = None
+    last_event_id = request.headers.get("Last-Event-ID") or request.query.get("since")
+    if last_event_id:
+        # Try numeric first (explicit unix ts).
+        try:
+            since_ts = int(last_event_id)
+        except ValueError:
+            # Otherwise treat as Nostr event id and look it up.
+            try:
+                async with aiohttp.ClientSession() as s2:
+                    async with s2.get(
+                        f"{_relay_http_from_ws(state.config['relays'][0])}/event/{last_event_id}",
+                        timeout=aiohttp.ClientTimeout(total=2),
+                    ) as rr:
+                        if rr.status == 200:
+                            ev = await rr.json(content_type=None)
+                            since_ts = int(ev.get("created_at", 0))
+            except Exception:
+                since_ts = None
 
     relay_http = _relay_http_from_ws(state.config["relays"][0])
     if relay_http is None:
@@ -753,13 +783,12 @@ async def handle_stream(request: web.Request) -> web.StreamResponse:
     )
     await resp.prepare(request)
 
-    # Start from current time (only show new events, not history)
     seen_ids: set[str] = set()
-    last_id: str | None = None
 
     await resp.write(b"event: connected\ndata: " + json.dumps({
         "channel": channel,
         "poll_interval_ms": POLL_INTERVAL_MS,
+        "since": since_ts,
     }).encode() + b"\n\n")
 
     async with aiohttp.ClientSession() as session:
@@ -767,7 +796,7 @@ async def handle_stream(request: web.Request) -> web.StreamResponse:
             while True:
                 try:
                     async with session.get(
-                        f"{relay_http}/events", timeout=aiohttp.ClientTimeout(total=5)
+                        f"{relay_http}/events", timeout=aiohttp.ClientTimeout(total=5),
                     ) as r:
                         r.raise_for_status()
                         events = await r.json(content_type=None)
@@ -782,21 +811,32 @@ async def handle_stream(request: web.Request) -> web.StreamResponse:
                         continue
                     if ev.get("kind") != 9:
                         continue
-                    # Check #h tag matches channel
                     if not _event_in_channel(ev, channel):
                         continue
+                    created_at = int(ev.get("created_at", 0))
+                    if since_ts is not None and created_at <= since_ts:
+                        # Event is older than or equal to our resume cutoff
+                        # — mark it seen so we don't re-emit it on
+                        # subsequent polls, but don't send it.  We use <=
+                        # because Last-Event-ID points to the LAST event
+                        # the client already saw; an exact-timestamp
+                        # replay would be a duplicate.
+                        seen_ids.add(eid)
+                        continue
                     seen_ids.add(eid)
-                    last_id = eid
                     payload = {
                         "event_id": eid,
                         "kind": ev.get("kind"),
                         "pubkey": ev.get("pubkey"),
-                        "created_at": ev.get("created_at"),
+                        "created_at": created_at,
                         "content": ev.get("content", ""),
                         "tags": ev.get("tags", []),
                     }
+                    # Emit SSE id line so EventSource can resume after
+                    # disconnect by sending Last-Event-ID on reconnect.
                     await resp.write(
-                        b"event: message\ndata: "
+                        b"id: " + eid.encode() + b"\n"
+                        + b"event: message\ndata: "
                         + json.dumps(payload).encode()
                         + b"\n\n"
                     )

@@ -127,6 +127,64 @@ cross-origin requests must include the production origin in
 See `HANDOFF.md` for the full peer-integration guide and `openapi.yaml` for
 the machine-readable OpenAPI 3.1 spec covering every endpoint.
 
+### Nostr Bridge (`agentchat.web.nostr_bridge`) — v1.2+
+
+The Nostr-native chat surface that powers the web UI. The bridge runs on
+`:9877` by default and talks to the local echo relay (`: `:9876`) via HTTP.
+All mutations require a logged-in session cookie (set by
+`/v1/auth/login`); reads are public.
+
+| Method | Path                                                       | Notes                               |
+|--------|------------------------------------------------------------|-------------------------------------|
+| GET    | `/`                                                        | Chat workspace (HTML)               |
+| GET    | `/settings`                                                | Settings page (HTML)                |
+| GET    | `/health`                                                  | Liveness probe                      |
+| GET    | `/v1/ui/channels`                                          | Channels the bridge knows about     |
+| GET    | `/v1/ui/agents`                                            | Loaded agents + npubs               |
+| GET    | `/v1/ui/stream?channel=<id>`                               | SSE: kind:9 events for a channel    |
+| GET    | `/v1/ui/stream?channel=<id>&since=<ts>`                    | SSE with resume cutoff (unix ts)    |
+| GET    | `/v1/ui/stream` + `Last-Event-ID: <nostr_event_id>`        | SSE resume from last seen event     |
+| POST   | `/v1/ui/post`                                              | Publish a kind:9 message            |
+| POST   | `/v1/auth/login`                                           | Public; sets session cookie         |
+| POST   | `/v1/auth/logout`                                          | Clear session cookie                |
+| GET    | `/v1/auth/whoami`                                          | Current session                     |
+| GET    | `/v1/auth/identities`                                      | List known local identities         |
+| GET    | `/v1/ui/memory/sources`                                    | List snapshot dirs (for import)     |
+| POST   | `/v1/ui/memory/import`                                     | Bootstrap a new agent's memory      |
+| GET    | `/v1/ui/memory/agents`                                     | All agents + structured sections    |
+| GET    | `/v1/ui/memory/agents/{name}`                              | One agent's sections                |
+| POST   | `/v1/ui/memory/agents/{name}/sections/{s}/lines`           | Append line                         |
+| DELETE | | `/v1/ui/memory/agents/{name}/sections/{s}/lines/{idx}`   | Remove line by index                |
+| PUT    | `/v1/ui/memory/agents/{name}/sections/{s}`                 | Replace section body                |
+
+Curl examples:
+
+```bash
+# Login (sets agentchat_session cookie)
+curl -c /tmp/jar -X POST http://localhost:9877/v1/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"hermes"}'
+
+# Post a message
+curl -b /tmp/jar -X POST http://localhost:9877/v1/ui/post \
+  -H 'Content-Type: application/json' \
+  -d '{"channel":"general","content":"hello from curl"}'
+
+# Subscribe to a channel via SSE (3s preview)
+timeout 3 curl -N http://localhost:9877/v1/ui/stream?channel=general
+
+# Read an agent's structured memory
+curl http://localhost:9877/v1/ui/memory/agents/hermes | jq
+
+# Edit a line in a section
+curl -b /tmp/jar -X PUT http://localhost:9877/v1/ui/memory/agents/hermes/sections/Prefs \
+  -H 'Content-Type: application/json' \
+  -d '{"lines":["loves terse replies","no fluff","uses vi"]}'
+```
+
+Smoke test: `./scripts/bridge-smoke.sh` (or `BRIDGE=host:port ./scripts/bridge-smoke.sh`).
+Full e2e suite: `pytest tests/test_bridge_e2e.py`.
+
 ### Webhooks (v1.1.0+)
 
 Subscribe external services to `thread_create`, `message_post`, and `react`

@@ -415,6 +415,21 @@ def _process_request(connection, request) -> Response | None:
     if path == "/events":
         return _json_response(json.dumps(STATE.events, indent=2).encode())
 
+    # /event/{id} — return a single event by its Nostr event id (hex).
+    # Used by SSE clients that send Last-Event-ID on reconnect: the bridge
+    # resolves the id back to its created_at to use as a resume cutoff.
+    if path.startswith("/event/"):
+        event_id = path[len("/event/"):]
+        for ev in STATE.events:
+            if ev.get("id") == event_id:
+                return _json_response(json.dumps(ev, indent=2).encode())
+        return Response(
+            404,
+            "Not Found",
+            Headers([("Content-Type", "application/json")]),
+            b'{"error": "event not found"}',
+        )
+
     if path == "/" or path == "":
         body = json.dumps({
             "name": "agentchat v1.2 echo relay",
@@ -423,6 +438,7 @@ def _process_request(connection, request) -> Response | None:
                 "GET /health",
                 "GET /stats",
                 "GET /events",
+                "GET /event/{id}",
                 f"WS {RELAY_URL}",
             ],
         }, indent=2).encode()
