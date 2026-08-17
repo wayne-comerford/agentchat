@@ -569,6 +569,105 @@ async def handle_memory_replace_section(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "name": name, "section": section, "lines": lines})
 
 
+# --------------------------------------------------------------------------- #
+# Shared team memory — used by all agents; supports R/W from any session
+# --------------------------------------------------------------------------- #
+
+
+async def handle_memory_shared_get(request: web.Request) -> web.Response:
+    """GET /v1/ui/memory/shared
+
+    Returns the team shared memory as a list of sections (same shape as
+    ``/v1/ui/memory/agents``). Read is unauthenticated; write is session-gated.
+    """
+    sections = memory_store.list_team_sections()
+    raw = memory_store.read_team()
+    return web.json_response({
+        "sections": sections,
+        "raw": raw,
+        "path": str(memory_store.team_shared_path()),
+    })
+
+
+async def handle_memory_shared_replace(request: web.Request) -> web.Response:
+    """PUT /v1/ui/memory/shared/sections/{section}
+
+    Body: ``{"lines": ["<line1>", "<line2>", ...]}``. Replaces the body
+    of a shared section. Creates the section if missing. Session-required
+    (any logged-in agent can write — there is no per-agent ownership on
+    shared memory; conflicts are resolved by flock + last-writer-wins on
+    a per-section basis).
+    """
+    section = request.match_info["section"]
+    session_name = request.cookies.get(COOKIE_NAME)
+    if not session_name:
+        return web.json_response({"error": "login required"}, status=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON"}, status=400)
+    lines = body.get("lines")
+    if not isinstance(lines, list):
+        return web.json_response({"error": "lines must be a list"}, status=400)
+    lines = [str(ln) for ln in lines]
+    try:
+        memory_store.replace_team_section(section, lines)
+    except Exception as e:
+        return web.json_response({"error": f"write failed: {e}"}, status=500)
+    return web.json_response({
+        "ok": True, "section": section, "lines": lines, "by": session_name,
+    })
+
+
+async def handle_memory_shared_append(request: web.Request) -> web.Response:
+    """POST /v1/ui/memory/shared/sections/{section}/lines
+
+    Body: ``{"line": "<text>"}``. Appends a single attributed line under
+    a shared section. Session-required.
+    """
+    section = request.match_info["section"]
+    session_name = request.cookies.get(COOKIE_NAME)
+    if not session_name:
+        return web.json_response({"error": "login required"}, status=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON"}, status=400)
+    line = (body.get("line") or "").strip()
+    if not line:
+        return web.json_response({"error": "line required"}, status=400)
+    try:
+        memory_store.append_team_line(section, line, author=session_name)
+    except Exception as e:
+        return web.json_response({"error": f"append failed: {e}"}, status=500)
+    return web.json_response({
+        "ok": True, "section": section, "line": line, "by": session_name,
+    })
+
+
+async def handle_memory_shared_delete_line(request: web.Request) -> web.Response:
+    """DELETE /v1/ui/memory/shared/sections/{section}/lines/{idx}
+
+    Removes one line (by 0-based index) from a shared section. Returns
+    404 if the section/line doesn't exist, 401 if no session.
+    """
+    section = request.match_info["section"]
+    idx = int(request.match_info["idx"])
+    session_name = request.cookies.get(COOKIE_NAME)
+    if not session_name:
+        return web.json_response({"error": "login required"}, status=401)
+    try:
+        removed = memory_store.remove_team_line(section, idx)
+    except Exception as e:
+        return web.json_response({"error": f"delete failed: {e}"}, status=500)
+    if not removed:
+        return web.json_response(
+            {"error": f"line {idx} not found in section '{section}'"},
+            status=404,
+        )
+    return web.json_response({"ok": True, "section": section, "idx": idx, "by": session_name})
+
+
 async def handle_static(request: web.Request) -> web.Response:
     """Serve static files from agentchat/web/static/.
 
@@ -1134,6 +1233,10 @@ def make_app(config: dict) -> web.Application:
     app.router.add_delete("/v1/ui/memory/agents/{name}/sections/{section}/lines/{idx}", handle_memory_delete_line)
     app.router.add_put("/v1/ui/memory/agents/{name}/sections/{section}", handle_memory_replace_section)
     app.router.add_post("/v1/ui/memory/import", handle_memory_import)
+    app.router.add_get("/v1/ui/memory/shared", handle_memory_shared_get)
+    app.router.add_put("/v1/ui/memory/shared/sections/{section}", handle_memory_shared_replace)
+    app.router.add_post("/v1/ui/memory/shared/sections/{section}/lines", handle_memory_shared_append)
+    app.router.add_delete("/v1/ui/memory/shared/sections/{section}/lines/{idx}", handle_memory_shared_delete_line)
     app.router.add_post("/v1/ui/post", handle_post)
     app.router.add_post("/v1/auth/login", handle_login)
     app.router.add_post("/v1/auth/logout", handle_logout)

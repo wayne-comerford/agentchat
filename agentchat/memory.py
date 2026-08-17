@@ -276,6 +276,108 @@ def list_agents() -> list[str]:
 
 
 # --------------------------------------------------------------------------- #
+# Team shared memory — section-aware helpers (used by the HTTP bridge)
+# --------------------------------------------------------------------------- #
+
+
+def list_team_sections() -> list[dict[str, Any]]:
+    """Return the team shared memory as a list of sections.
+
+    Same shape as :func:`list_agent_sections` (title / lines / index) so the
+    UI can render shared memory using the same drawer. The first H1
+    preamble (if any) is returned under title ``None`` so the UI can
+    render the team display name + intro separately.
+    """
+    raw = read_team()
+    parsed = _split_sections(raw)
+    sections: list[dict[str, Any]] = []
+    for idx, (title, body) in enumerate(parsed):
+        lines = [
+            stripped for stripped in (ln.strip() for ln in body.splitlines())
+            if stripped
+        ]
+        sections.append({"title": title, "lines": lines, "index": idx})
+    return sections
+
+
+def replace_team_section(section_title: str, new_lines: list[str]) -> None:
+    """Replace the body of ``## section_title`` in the team shared memory.
+
+    Creates the section if it doesn't already exist. Uses ``_file_lock``
+    so concurrent writers from different agents don't stomp each other.
+    """
+    p = team_shared_path()
+    with _file_lock(p):
+        existing = read_text(p)
+        new_md = _replace_section_in_md(existing, section_title, new_lines)
+        atomic_write_text(p, new_md)
+
+
+def append_team_line(section: str, line: str, *, author: str) -> None:
+    """Append ``line`` under ``## section`` in the team shared memory.
+
+    Uses the same attribution-trail pattern as ``append_team``: each line
+    gets a ``— author @ ISO`` sub-tail so multi-agent writes are
+    traceable.
+    """
+    p = team_shared_path()
+    ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    attribution = f"  \n<sub>— {author} @ {ts}</sub>" if line else ""
+    with _file_lock(p):
+        existing = read_text(p)
+        updated = _append_under_section(existing, section, line + attribution)
+        atomic_write_text(p, updated)
+
+
+def remove_team_line(section: str, line_index: int) -> bool:
+    """Delete one line (by index) from a shared section.
+
+    Returns True if a line was removed, False if the section or line
+    was not found. Lock-protected for concurrent writers.
+    """
+    p = team_shared_path()
+    with _file_lock(p):
+        existing = read_text(p)
+        updated = _remove_line_in_section(existing, section, line_index)
+        if updated == existing:
+            return False
+        atomic_write_text(p, updated)
+        return True
+
+
+def _remove_line_in_section(md: str, section_title: str, line_index: int) -> str:
+    """Return ``md`` with one line removed from ``## section_title``.
+
+    ``line_index`` is 0-based after the same stripping rules used by
+    ``list_team_sections`` (blank lines dropped, whitespace stripped).
+    Returns ``md`` unchanged when the section or line isn't found.
+    """
+    h2_pat = re.compile(r"^##\s+(.+?)\s*$", re.MULTILINE)
+    matches = list(h2_pat.finditer(md))
+    target = None
+    for m in matches:
+        if m.group(1).strip().lower() == section_title.strip().lower():
+            target = m
+            break
+    if target is None:
+        return md
+    body_start = target.end()
+    target_idx = matches.index(target)
+    body_end = matches[target_idx + 1].start() if target_idx + 1 < len(matches) else len(md)
+    body = md[body_start:body_end]
+    lines = [
+        ln for ln in (
+            stripped for stripped in (l.strip() for l in body.splitlines())
+        ) if ln
+    ]
+    if line_index < 0 or line_index >= len(lines):
+        return md
+    del lines[line_index]
+    new_body = "\n" + "\n".join(lines) + "\n\n" if lines else "\n"
+    return md[:body_start] + new_body + md[body_end:]
+
+
+# --------------------------------------------------------------------------- #
 # Team shared memory
 # --------------------------------------------------------------------------- #
 
