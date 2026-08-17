@@ -10,10 +10,14 @@ A small aiohttp HTTP/SSE server that:
 
 Endpoints:
     GET  /                            — base HTML shell
+    GET  /settings                    — settings page
     GET  /static/<path>               — CSS / JS / images
     GET  /v1/ui/channels              — JSON list of channels (from config)
-    GET  /v1/ui/agents                — JSON list of agents (from registry)
+    GET  /v1/ui/agents                — JSON list of agents (with status_entry)
+    GET  /v1/ui/focus                 — JSON focus_map (agent -> channel)
+    POST /v1/ui/focus                 — pin/clear focused channel (session-auth)
     GET  /v1/ui/stream?channel=<id>   — SSE: kind:9 events for that channel
+                                       (special: channel=agent_status → liveness stream)
     POST /v1/ui/post                  — sign + publish kind:9
     GET  /health                      — liveness
 
@@ -32,6 +36,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import time
 import logging
 import os
 import signal
@@ -134,6 +139,19 @@ def load_config() -> dict:
 class BridgeState:
     """Shared mutable state across requests."""
 
+    # SSE subscribers for the agent_status channel.
+    # Each entry is an asyncio.Queue; subscribers consume from it and emit SSE.
+    agent_status_subs: list[asyncio.Queue] = []
+    # Per-agent focus: name -> {"channel": str, "since": float}
+    focus_map: dict[str, dict] = {}
+    # Per-agent liveness: name -> {"status": "active"|"idle"|"disconnected",
+    #                              "last_activity_ts": float,
+    #                              "focused_channel": str | None,
+    #                              "last_message": str | None}
+    agent_status: dict[str, dict] = {}
+    IDLE_AFTER_SECONDS = 120  # if no activity for this long → idle
+    DISCONNECTED_AFTER_SECONDS = 600  # if no activity → disconnected
+
     def __init__(self, config: dict):
         self.config = config
         self.keys: NostrKeys | None = None
@@ -191,6 +209,85 @@ class BridgeState:
     async def shutdown(self) -> None:
         if self.pool is not None:
             self.pool.stop_listen()
+
+
+# --------------------------------------------------------------------------- #
+# Agent liveness + focus helpers (shared by routes)
+# --------------------------------------------------------------------------- #
+
+
+def record_activity(agent_name: str, channel: str | None = None,
+                    last_message: str | None = None) -> None:
+    """Mark an agent as active right now; bumps last_activity_ts and last_message."""
+    truncated = last_message[:120] if last_message is not None else None
+    if agent_name not in BridgeState.agent_status:
+        BridgeState.agent_status[agent_name] = {
+            "status": "active",
+            "last_activity_ts": time.time(),
+            "focused_channel": channel,
+            "last_message": truncated,
+        }
+    else:
+        s = BridgeState.agent_status[agent_name]
+        s["status"] = "active"
+        s["last_activity_ts"] = time.time()
+        if channel is not None:
+            s["focused_channel"] = channel
+        if last_message is not None:
+            s["last_message"] = truncated
+    # Broadcast to SSE subscribers (best-effort).
+    payload = {
+        "type": "agent_status",
+        "agent": agent_name,
+        "state": BridgeState.agent_status[agent_name],
+    }
+    for q in list(BridgeState.agent_status_subs):
+        try:
+            q.put_nowait(payload)
+        except asyncio.QueueFull:
+            pass
+
+
+def set_focus(agent_name: str, channel: str | None) -> None:
+    """Pin or clear an agent's focused channel. None → clear."""
+    if channel is None:
+        BridgeState.focus_map.pop(agent_name, None)
+        if agent_name in BridgeState.agent_status:
+            BridgeState.agent_status[agent_name]["focused_channel"] = None
+    else:
+        BridgeState.focus_map[agent_name] = {
+            "channel": channel,
+            "since": time.time(),
+        }
+        if agent_name not in BridgeState.agent_status:
+            BridgeState.agent_status[agent_name] = {
+                "status": "idle",
+                "last_activity_ts": 0.0,
+                "focused_channel": channel,
+                "last_message": None,
+            }
+        else:
+            BridgeState.agent_status[agent_name]["focused_channel"] = channel
+    payload = {
+        "type": "focus",
+        "agent": agent_name,
+        "channel": channel,
+    }
+    for q in list(BridgeState.agent_status_subs):
+        try:
+            q.put_nowait(payload)
+        except asyncio.QueueFull:
+            pass
+
+
+def compute_status(agent_state: dict) -> str:
+    """Recompute status string from last_activity_ts."""
+    age = time.time() - agent_state.get("last_activity_ts", 0.0)
+    if age > BridgeState.DISCONNECTED_AFTER_SECONDS:
+        return "disconnected"
+    if age > BridgeState.IDLE_AFTER_SECONDS:
+        return "idle"
+    return "active"
 
 
 STATE: BridgeState | None = None
@@ -516,17 +613,31 @@ async def handle_channels(request: web.Request) -> web.Response:
 
 
 async def handle_agents(request: web.Request) -> web.Response:
-    """JSON list of agents from the registry, optionally filtered by prefix."""
+    """JSON list of agents from the registry, optionally filtered by prefix.
+
+    Each entry includes the live status (active/idle/disconnected) and the
+    currently focused channel (if any). Status is recomputed from
+    last_activity_ts on every read so the sidebar is always fresh.
+    """
     state = get_state(request.app)
     prefix = request.query.get("prefix", "").lower()
     out = []
     for name, info in state.registry.items():
         if prefix and prefix not in name.lower() and prefix not in info.get("npub", "").lower():
             continue
+        status_entry = BridgeState.agent_status.get(name)
+        if status_entry:
+            computed = compute_status(status_entry)
+            status_entry = {
+                **status_entry,
+                "status": computed,
+                "age_seconds": round(time.time() - status_entry["last_activity_ts"], 1),
+            }
         out.append({
             "name": name,
             "npub": info.get("npub"),
             "public_key_hex": info.get("public_key_hex"),
+            "status_entry": status_entry,
         })
     return web.json_response(out)
 
@@ -540,6 +651,44 @@ async def handle_health(request: web.Request) -> web.Response:
         "channels": [c["id"] for c in state.config.get("channels", [])],
         "agents_loaded": len(state.registry),
     })
+
+
+async def handle_focus_get(request: web.Request) -> web.Response:
+    """Return the current focus_map (agent -> channel)."""
+    return web.json_response(BridgeState.focus_map)
+
+
+async def handle_focus_post(request: web.Request) -> web.Response:
+    """Pin or clear an agent's focused channel.
+
+    Body: {"agent": "<name>", "channel": "<id>" | null}
+
+    Returns 400 on missing/invalid fields, 401 if no session (so the
+    focus can't be hijacked over LAN).
+    """
+    session_name = request.cookies.get("agentchat_session")
+    if not session_name:
+        return web.json_response(
+            {"error": "login required — POST /v1/auth/login first"},
+            status=401,
+        )
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON"}, status=400)
+    agent = (body.get("agent") or "").strip()
+    channel = body.get("channel")
+    if channel is not None:
+        channel = str(channel).strip() or None
+    if not agent:
+        return web.json_response({"error": "agent required"}, status=400)
+    state = get_state(request.app)
+    if agent not in state.registry and agent != session_name:
+        return web.json_response(
+            {"error": f"unknown agent: {agent}"}, status=400
+        )
+    set_focus(agent, channel)
+    return web.json_response({"ok": True, "agent": agent, "channel": channel})
 
 
 async def handle_post(request: web.Request) -> web.Response:
@@ -602,6 +751,12 @@ async def handle_post(request: web.Request) -> web.Response:
             content=content,
             mentions=mentions,
         )
+        # Record activity for the logged-in session (sidebar live status).
+        record_activity(session_name, channel=channel, last_message=content)
+        # If the session agent has a focused channel set, refocus so the
+        # sidebar reflects "currently posting in #X".
+        if session_name in BridgeState.focus_map:
+            set_focus(session_name, BridgeState.focus_map[session_name]["channel"])
         return web.json_response({
             "ok": True,
             "event_id": event_id,
@@ -718,6 +873,69 @@ async def cors_middleware(request: web.Request, handler):
     return resp
 
 
+async def _handle_stream_agent_status(request: web.Request) -> web.StreamResponse:
+    """SSE channel that emits agent liveness + focus change events.
+
+    Subscribers receive a snapshot of current state on connect, then
+    every focus / activity change is pushed as an SSE event. A heartbeat
+    keeps the connection alive across NAT/proxy idle timeouts.
+    """
+    resp = web.StreamResponse(
+        status=200,
+        reason="OK",
+        headers={
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+    await resp.prepare(request)
+
+    # Each subscriber gets its own queue. We push events into it from
+    # set_focus/record_activity and consume here.
+    queue: asyncio.Queue = asyncio.Queue(maxsize=256)
+    BridgeState.agent_status_subs.append(queue)
+
+    try:
+        # Initial snapshot — sidebar can render before any new event.
+        snapshot = {
+            "agents": {
+                name: {
+                    **state,
+                    "status": compute_status(state),
+                    "age_seconds": round(time.time() - state.get("last_activity_ts", 0.0), 1),
+                }
+                for name, state in BridgeState.agent_status.items()
+            },
+            "focus": dict(BridgeState.focus_map),
+        }
+        await resp.write(
+            b"event: snapshot\ndata: " + json.dumps(snapshot).encode() + b"\n\n"
+        )
+
+        while True:
+            try:
+                payload = await asyncio.wait_for(queue.get(), timeout=10.0)
+                event_name = payload.get("type", "agent_status")
+                await resp.write(
+                    f"event: {event_name}\ndata: ".encode()
+                    + json.dumps(payload).encode()
+                    + b"\n\n"
+                )
+            except asyncio.TimeoutError:
+                await resp.write(b": heartbeat\n\n")
+    except (ConnectionResetError, asyncio.CancelledError):
+        pass
+    finally:
+        try:
+            BridgeState.agent_status_subs.remove(queue)
+        except ValueError:
+            pass
+
+    return resp
+
+
 async def handle_stream(request: web.Request) -> web.StreamResponse:
     """
     SSE stream: pushes kind:9 events for one channel.
@@ -742,6 +960,11 @@ async def handle_stream(request: web.Request) -> web.StreamResponse:
     channel = request.query.get("channel", "").strip()
     if not channel:
         return web.json_response({"error": "channel required"}, status=400)
+
+    # Special internal channel: agent_status. Subscribers receive live
+    # liveness + focus events broadcast by set_focus() and record_activity().
+    if channel == "agent_status":
+        return await _handle_stream_agent_status(request)
 
     # Resolve the resume cutoff.  Last-Event-ID header takes precedence
     # over ?since= (matches the SSE spec).  We treat the id as a Nostr
@@ -901,6 +1124,8 @@ def make_app(config: dict) -> web.Application:
     app.router.add_get("/static/{path:.*}", handle_static)
     app.router.add_get("/v1/ui/channels", handle_channels)
     app.router.add_get("/v1/ui/agents", handle_agents)
+    app.router.add_get("/v1/ui/focus", handle_focus_get)
+    app.router.add_post("/v1/ui/focus", handle_focus_post)
     app.router.add_get("/v1/ui/stream", handle_stream)
     app.router.add_get("/v1/ui/memory/sources", handle_memory_list_sources)
     app.router.add_get("/v1/ui/memory/agents", handle_memory_list_agents)

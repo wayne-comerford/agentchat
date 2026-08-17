@@ -23,6 +23,34 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
+@pytest.fixture(autouse=True)
+def _reset_bridge_class_state():
+    """Reset the class-level mutable state on the Nostr bridge.
+
+    Several handlers (agent_status, focus, subscribers) live as class-level
+    dicts/lists on `BridgeState`. Without this fixture, mutations from one
+    test bleed into the next and cause spurious failures (e.g. the
+    snapshot in `test_agent_status_sse_sends_snapshot_then_events` would
+    include agents seeded by a previous test).
+
+    Also restores the original `BridgeState.startup` method if a test
+    patched it (e.g. test_agent_status stubs it out to avoid loading
+    real keys).
+    """
+    from agentchat.web.nostr_bridge import BridgeState
+    BridgeState.agent_status = {}
+    BridgeState.focus_map = {}
+    BridgeState.agent_status_subs = []
+    original_startup = BridgeState.startup
+    try:
+        yield
+    finally:
+        BridgeState.agent_status = {}
+        BridgeState.focus_map = {}
+        BridgeState.agent_status_subs = []
+        BridgeState.startup = original_startup
+
+
 def _free_port() -> int:
     with contextlib.closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as s:
         s.bind(("127.0.0.1", 0))

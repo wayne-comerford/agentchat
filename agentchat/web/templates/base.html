@@ -104,8 +104,29 @@
                   :style="`background: ${avatarColor(a.npub)}`"
                   x-text="a.name.slice(0, 2).toUpperCase()"
                 ></span>
-                <span x-text="a.name" class="flex-1"></span>
-                <span class="w-2 h-2 rounded-full bg-emerald-400"></span>
+                <span x-text="a.name" class="flex-1 truncate"></span>
+                <!-- Live status dot: green=active, amber=idle, red=disconnected -->
+                <span class="relative inline-flex items-center mr-1">
+                  <span
+                    class="w-2 h-2 rounded-full"
+                    :class="{
+                      'bg-emerald-400': (a.status_entry?.status || 'disconnected') === 'active',
+                      'bg-amber-400': a.status_entry?.status === 'idle',
+                      'bg-rose-500': !a.status_entry || a.status_entry?.status === 'disconnected'
+                    }"
+                    :title="(a.status_entry?.status || 'unknown') + (a.status_entry?.focused_channel ? ' · focused ' + a.status_entry.focused_channel : '')"
+                  ></span>
+                  <span
+                    x-show="(a.status_entry?.status || 'disconnected') === 'active'"
+                    class="absolute inset-0 w-2 h-2 rounded-full bg-emerald-400 opacity-75 animate-ping"
+                  ></span>
+                </span>
+                <!-- Focused-channel pill -->
+                <span
+                  x-show="a.status_entry?.focused_channel"
+                  class="ml-1 text-[10px] px-1.5 py-0.5 rounded bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 font-mono"
+                  x-text="'#' + a.status_entry.focused_channel"
+                ></span>
               </button>
             </li>
           </template>

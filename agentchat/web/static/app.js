@@ -59,6 +59,9 @@ function workspace() {
       } catch (e) {
         console.error('boot failed', e);
       }
+      // Start the agent_status SSE so the sidebar can render live liveness
+      // + focused channel updates without polling.
+      this.connectAgentStatus();
       // Auto-select: prefer #general (where the work happens), else first channel
       if (this.channels.length > 0) {
         const preferred = this.channels.find(c => c.id === 'general') || this.channels[0];
@@ -112,6 +115,88 @@ function workspace() {
       this.activeAgent = a;
       this.activeChannel = null;
       this.detachStream();
+    },
+
+    // ─────────── agent_status SSE ───────────
+    connectAgentStatus() {
+      // Tear down any existing connection before reconnecting.
+      if (this._agentStatusES) {
+        try { this._agentStatusES.close(); } catch (e) {}
+        this._agentStatusES = null;
+      }
+      let es;
+      try {
+        es = new EventSource('/v1/ui/stream?channel=agent_status', { withCredentials: true });
+      } catch (e) {
+        console.error('agent_status EventSource failed to construct', e);
+        setTimeout(() => this.connectAgentStatus(), 3000);
+        return;
+      }
+      this._agentStatusES = es;
+
+      // Initial snapshot — populate status_entry on every agent.
+      es.addEventListener('snapshot', (ev) => {
+        try {
+          const snap = JSON.parse(ev.data);
+          this.applyAgentStatusSnapshot(snap);
+        } catch (e) { /* ignore */ }
+      });
+
+      // Per-agent status updates — merge into the matching agents[] entry.
+      es.addEventListener('agent_status', (ev) => {
+        try {
+          const payload = JSON.parse(ev.data);
+          this.applyAgentStatus(payload.agent, payload.state);
+        } catch (e) { /* ignore */ }
+      });
+
+      // Focus pin/clear events.
+      es.addEventListener('focus', (ev) => {
+        try {
+          const payload = JSON.parse(ev.data);
+          this.applyAgentFocus(payload.agent, payload.channel);
+        } catch (e) { /* ignore */ }
+      });
+
+      // On error, the EventSource will auto-reconnect, but if the close
+      // was hard we tear down and reconnect ourselves to avoid stuck state.
+      es.addEventListener('error', () => {
+        if (es.readyState === EventSource.CLOSED) {
+          setTimeout(() => this.connectAgentStatus(), 3000);
+        }
+      });
+    },
+
+    applyAgentStatusSnapshot(snap) {
+      const statusByName = snap.agents || {};
+      const focusByName = snap.focus || {};
+      this.agents = this.agents.map((a) => {
+        const s = statusByName[a.name] || null;
+        const f = focusByName[a.name]?.channel || null;
+        return {
+          ...a,
+          status_entry: s
+            ? { ...s, focused_channel: s.focused_channel || f }
+            : (f ? { status: 'idle', last_activity_ts: 0, focused_channel: f, last_message: null } : null),
+        };
+      });
+    },
+
+    applyAgentStatus(name, state) {
+      this.agents = this.agents.map((a) =>
+        a.name === name ? { ...a, status_entry: state } : a
+      );
+    },
+
+    applyAgentFocus(name, channel) {
+      this.agents = this.agents.map((a) => {
+        if (a.name !== name) return a;
+        const se = a.status_entry || {
+          status: 'idle', last_activity_ts: 0,
+          focused_channel: null, last_message: null,
+        };
+        return { ...a, status_entry: { ...se, focused_channel: channel } };
+      });
     },
 
     // ─────────── SSE stream ───────────
