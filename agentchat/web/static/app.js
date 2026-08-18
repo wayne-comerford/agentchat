@@ -258,8 +258,73 @@ function workspace() {
     },
 
     // ─────────── post ───────────
+    // Composer keyboard handler. Replaces the previous
+    // `@keydown.enter.exact.prevent` modifier on the textarea, which
+    // failed in three real-world cases:
+    //   1. IME composition (typing CJK) — the Enter that finalises a
+    //      candidate has ``isComposing=true`` and the modifier bailed,
+    //      so the newline fired as default. We now check ``isComposing``
+    //      and let the IME handle it.
+    //   2. Mention dropdown open — the modifier still fired
+    //      ``postMessage()``, so typing ``@he`` + Enter sent the
+    //      literal ``@he`` instead of picking the highlighted agent.
+    //      We now select the highlighted mention when the dropdown is
+    //      open, and only send when it is closed.
+    //   3. Async post in flight — the modifier fired, ``postMessage``
+    //      returned silently, the user saw nothing happen. The
+    //      ``posting`` guard is unchanged but we now ``console.warn``
+    //      so the bails are debuggable from devtools.
+    handleComposerKey(e) {
+      // IME composition: let the IME handle Enter (it finalises the
+      // candidate, which is what the user wants).
+      if (e.isComposing || e.keyCode === 229) return;
+
+      // Arrow keys: navigate the mention dropdown if it is open.
+      if (this.mentionOpen) {
+        if (e.key === 'ArrowDown') {
+          e.preventDefault();
+          this.mentionSelected = (this.mentionSelected + 1)
+            % Math.max(this.mentionSuggestions.length, 1);
+          return;
+        }
+        if (e.key === 'ArrowUp') {
+          e.preventDefault();
+          this.mentionSelected = (this.mentionSelected - 1
+            + this.mentionSuggestions.length)
+            % Math.max(this.mentionSuggestions.length, 1);
+          return;
+        }
+        if (e.key === 'Escape') {
+          e.preventDefault();
+          this.mentionOpen = false;
+          return;
+        }
+        if (e.key === 'Enter' && !e.shiftKey) {
+          e.preventDefault();
+          const pick = this.mentionSuggestions[this.mentionSelected];
+          if (pick) this.applyMention(pick);
+          return;
+        }
+      }
+
+      // Plain Enter (no Shift, dropdown closed) -> send.
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        this.postMessage();
+        return;
+      }
+
+      // Shift+Enter falls through to the textarea default (newline).
+    },
+
     async postMessage() {
-      if (!this.activeChannel || !this.draft.trim() || this.posting) return;
+      if (!this.activeChannel || !this.draft.trim() || this.posting) {
+        // Log silent bails so the operator can debug from devtools.
+        if (!this.activeChannel) console.debug('postMessage: no active channel');
+        else if (!this.draft.trim()) console.debug('postMessage: empty draft');
+        else if (this.posting) console.debug('postMessage: already posting');
+        return;
+      }
       if (!this.myName) {
         alert('Sign in first (click ⇅ at the bottom of the sidebar).');
         return;

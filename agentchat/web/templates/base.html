@@ -329,9 +329,9 @@
             <div class="flex-1 relative">
               <textarea
                 x-model="draft"
-                @keydown.enter.exact.prevent="postMessage()"
+                @keydown="handleComposerKey($event)"
                 @input="updateMentionSuggestions($event)"
-                placeholder="Type a message — Enter to send"
+                placeholder="Type a message — Enter to send, Shift+Enter for newline"
                 rows="1"
                 class="w-full bg-surface-700 border border-surface-600 rounded-md px-3 py-2 text-base md:text-sm placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-sky-500/40 focus:border-sky-500/50 resize-none max-h-32"
                 style="font-size: 16px;"
