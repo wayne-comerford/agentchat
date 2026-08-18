@@ -351,6 +351,117 @@ event stream, the MCP stdio server, and the auth rate limiter.
 
 ---
 
+## GitHub sync (v1.2.0.dev20)
+
+One-shot mirror of memory + scrubbed config to a per-workspace GitHub repo.
+The sync agent is the durable source of truth for your agent's memory:
+every push writes an append-only audit log entry, and secrets are scrubbed
+**before** any file lands in the mirror.
+
+**Architecture.** The new `agentchat/sync_agent/` package is the long-term
+home for change-detection + push with SSH / PAT / GitHub-App auth and
+typed retries. `agentchat-sync` is the convenience CLI that wraps it
+with a one-shot "do everything now" command — useful for cron jobs,
+operators, and first-time setup. Both share the scrubber logic
+(`SCRUB_PATTERNS` in `agentchat/sync_github.py`).
+
+**Install.** Already shipped via `pyproject.toml`:
+
+```bash
+pip install -e .
+agentchat-sync --help
+```
+
+**One-time setup.** Pick a workspace slug (defaults to your `HERMES_HOME`
+basename) and create an empty repo on GitHub named
+`agentchat-mirror-<slug>` (or override with `--remote`):
+
+```bash
+# On your laptop's browser, once:
+#   github.com/new → name: agentchat-mirror-default → public → Create
+# Then on Node3:
+agentchat-sync doctor              # verifies git, SSH, workspace
+agentchat-sync init                # writes sample config + audit log
+agentchat-sync push --dry-run      # builds + scrubs but does NOT push
+agentchat-sync push                # commits + pushes via SSH
+```
+
+**What gets pushed.** Only what you want backed up:
+
+```
+memory/agents/<name>/MEMORY.md     ← scrubbed (secrets redacted)
+memory/team/SHARED.md              ← scrubbed
+memory/projects/<slug>.md          ← scrubbed
+config/nostr-registry.json         ← public keys + npub, scrubbed
+config/personas/                   ← scrubbed
+README.md                          ← auto-generated, lists scrubbed patterns
+workspace.yaml                     ← auto-generated
+.gitignore                         ← excludes .last-push, .bak, __pycache__
+audit/audit.jsonl                  ← append-only per-push audit trail
+```
+
+**What is NEVER pushed** (even though it lives in your workspace):
+
+- `*.nsec.json` (Nostr private keys)
+- `tokens.json` (backplane API tokens)
+- `.env`, `.env.local`, `.env.production`
+- `id_rsa`, `id_ed25519`, `.netrc`
+- `__pycache__/`, `.venv/`, `node_modules/`
+- `archive/` (local memory snapshots)
+
+**What is scrubbed before push.** The following 11 secret classes are
+replaced with `***REDACTED:<reason>***` sentinels in every pushed file:
+
+| Category | Example | Reason label |
+|---|---|---|
+| Nostr private key | `nsec1qpzry9x8...` | `nostr-nsec` |
+| Hex private key | `private_key=abcdef0123...` | `hex-private-key` |
+| GitHub PAT | `ghp_aBcDeFgHi...` | `github-pat` |
+| GitHub fine-grained PAT | `github_pat_11ABC...` | `github-fine-grained-pat` |
+| OpenAI key | `sk-proj-abc123...` | `openai-key` |
+| Anthropic key | `sk-ant-api03-...` | `anthropic-key` |
+| Slack token | `xoxb-12345678...` | `slack-token` |
+| Bearer token | `Authorization: Bearer abc123...` | `bearer-token` |
+| Auth secret | `AUTH_SECRET="my-very-secret-..."` | `auth-secret` |
+| Password | `password: hunter2hunter2` | `password` |
+| OAuth token | `oauth_token: ya29.a0Af...` | `oauth-token` |
+
+**Public keys are kept.** `npub1...` is a public identifier and stays in
+the pushed file. `gh[pus]_...` is replaced (those are PATs, not users).
+
+**Verify after a push.** Clone the mirror and confirm the secret isn't
+there:
+
+```bash
+git clone git@github.com:wayne-comerford/agentchat-mirror-default.git /tmp/check
+grep -r REDACTED /tmp/check/memory    # should list every redaction
+grep -r 'nsec1' /tmp/check/           # should find NOTHING
+```
+
+**Inspect the local audit log:**
+
+```bash
+agentchat-sync audit tail -n 20
+agentchat-sync audit show 2026-08-18
+```
+
+**What is deferred to dev21+:**
+
+- Daemon mode (`agentchat-sync watch`) — auto-push on file change. The
+  `sync_agent.watcher` module already supports it; the CLI wrapper is
+  the missing piece.
+- PR review flow (requires GitHub API token; `gh auth login` first).
+- Multi-host federation (v1.3) — when you run agentchat on multiple
+  machines, each one mirrors its own workspace to the same repo with
+  per-host commits.
+
+**Backups without GitHub.** `agentchat-sync` requires a remote, but
+`agentchat-memory-export` (in `agentchat/memory.py`) dumps an entire
+agent's memory tree to a tarball for offline backup. Combine the two:
+mirror for review-grade history, tarballs for emergency restore.
+
+---
+
 ## License
 
 MIT. See `LICENSE`.

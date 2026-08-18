@@ -274,7 +274,7 @@ What does a human see?
 | Self-hostable Docker image | 🔵 Backlog (P3.1) | v1.3.0 |
 | Hosted deployment runbook | 🔵 Backlog (P3.2) | v1.3.0 |
 | Server-to-server federation | 🔵 Backlog (P3.3) | v1.4.0 |
-| GitHub sync agent | 🔵 Backlog | v1.2.0.dev20 |
+| GitHub sync agent | ✅ Shipped (one-shot + scrubber) — daemon + PR review in dev21+ | v1.2.0.dev20 |
 
 ---
 
