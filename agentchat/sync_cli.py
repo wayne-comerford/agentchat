@@ -80,6 +80,37 @@ def build_parser() -> argparse.ArgumentParser:
     sp_status.add_argument("--json", action="store_true", help="Print as JSON.")
     sp_status.set_defaults(func=cmd_status)
 
+    # Pull subcommand (v1.2.0.dev27)
+    sp_pull = sub.add_parser(
+        "pull",
+        help="Fetch from remote and fast-forward local branch.",
+    )
+    sp_pull.add_argument(
+        "--remote", default="origin",
+        help="Remote name (default: origin)",
+    )
+    sp_pull.add_argument(
+        "--branch", default=None,
+        help="Branch to pull (default: current branch)",
+    )
+    sp_pull.add_argument(
+        "--repo-dir", default=None,
+        help="Path to git repo (default: current working directory)",
+    )
+    sp_pull.add_argument(
+        "--dry-run", action="store_true",
+        help="Compute ahead/behind and report, but don't mutate.",
+    )
+    sp_pull.add_argument(
+        "--allow-rebase", action="store_true",
+        help="If diverged, rebase local onto remote (operator only).",
+    )
+    sp_pull.add_argument(
+        "--json", action="store_true",
+        help="Print result as JSON.",
+    )
+    sp_pull.set_defaults(func=cmd_pull)
+
     sp_init = sub.add_parser("init", help="One-time setup: write audit + sample config.")
     sp_init.add_argument(
         "--remote", default=None, help="Override the sample remote URL written to config.example.json."
@@ -235,6 +266,75 @@ def cmd_status(args: argparse.Namespace) -> int:
     else:
         print(sg.format_status(d))
     return 0
+
+
+def cmd_pull(args: argparse.Namespace) -> int:
+    """
+    Handle `agentchat-sync pull` (v1.2.0.dev27).
+
+    Pulls from the configured remote, fast-forwarding if possible.
+    Surfaces conflicts to ~/.hermes/agent_chat/pull_conflicts/<ts>/
+    instead of clobbering uncommitted local changes.
+    """
+    from agentchat.sync_agent import pull as pull_mod
+    workspace_slug = _workspace_slug(args)
+    repo_dir = Path(args.repo_dir).expanduser().resolve() if args.repo_dir else Path.cwd()
+    if not repo_dir.exists():
+        print(f"repo_dir does not exist: {repo_dir}", file=sys.stderr)
+        return 2
+    # If --branch is None, ask git for the current branch
+    branch = args.branch
+    if not branch:
+        rc, out, _ = pull_mod.SubprocessGitClient().run(
+            ["rev-parse", "--abbrev-ref", "HEAD"], cwd=repo_dir,
+        )
+        if rc == 0:
+            branch = out.strip()
+        else:
+            branch = "main"
+    try:
+        result = pull_mod.pull_remote(
+            repo_dir=repo_dir,
+            remote=args.remote,
+            branch=branch,
+            dry_run=args.dry_run,
+            allow_rebase=args.allow_rebase,
+        )
+    except pull_mod.NoRemoteError as e:
+        print(f"no remote: {e}", file=sys.stderr)
+        return 3
+    except pull_mod.DivergedError as e:
+        print(str(e), file=sys.stderr)
+        return 4
+    except pull_mod.LocalDirtyError as e:
+        print(str(e), file=sys.stderr)
+        return 5
+    except pull_mod.GitError as e:
+        print(str(e), file=sys.stderr)
+        return 6
+
+    if args.json:
+        print(json.dumps(result.to_dict(), indent=2))
+    else:
+        verb = {
+            "up_to_date": "already up to date",
+            "fast_forwarded": "fast-forwarded",
+            "diverged": "diverged (no auto-pull)",
+            "local_dirty": "local dirty (refused; conflicts saved)",
+            "no_remote": "no remote configured",
+            "error": "error",
+        }.get(result.status, result.status)
+        print(
+            f"pull {verb}  ahead={result.ahead}  behind={result.behind}  "
+            f"local={result.local_sha[:12] or '-':<12}  "
+            f"remote={result.remote_sha[:12] or '-':<12}  "
+            f"duration={result.duration_s:.2f}s"
+        )
+        if result.conflict_dir:
+            print(f"conflict snapshot: {result.conflict_dir}")
+        if result.error and result.status != "no_remote":
+            print(f"note: {result.error}", file=sys.stderr)
+    return 0 if result.ok else 1
 
 
 def cmd_init(args: argparse.Namespace) -> int:
