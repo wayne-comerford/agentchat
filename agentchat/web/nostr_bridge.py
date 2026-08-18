@@ -1531,7 +1531,169 @@ def make_app(config: dict) -> web.Application:
     app.router.add_post("/v1/auth/logout", handle_logout)
     app.router.add_get("/v1/auth/whoami", handle_whoami)
     app.router.add_get("/v1/auth/identities", handle_identities)
+    # PR review (v1.2.0.dev25)
+    app.router.add_get("/v1/ui/reviews", handle_reviews)
+    app.router.add_get("/v1/ui/reviews/{number}", handle_review_detail)
+    app.router.add_post("/v1/ui/reviews/{number}/comments", handle_review_post_comment)
+    app.router.add_get("/v1/ui/reviews/{number}/local-comments", handle_review_local_comments)
+    # GitHub webhook receive
+    app.router.add_post("/v1/webhook/github", handle_github_webhook)
     return app
+
+
+# --------------------------------------------------------------------------- #
+# PR review handlers (v1.2.0.dev25)
+# --------------------------------------------------------------------------- #
+
+PR_REVIEW_DEFAULT_REPO = os.environ.get(
+    "AGENTCHAT_PR_REVIEW_REPO", "wayne-comerford/agentchat"
+)
+
+
+async def handle_reviews(request: web.Request) -> web.Response:
+    """
+    GET /v1/ui/reviews — list open PRs + recent webhook events.
+
+    Query params:
+      ?repo=owner/name   (default: env AGENTCHAT_PR_REVIEW_REPO)
+    """
+    from agentchat import pr_review
+
+    repo = request.query.get("repo", PR_REVIEW_DEFAULT_REPO)
+    out: dict = {"repo": repo, "prs": [], "webhook_events": [], "error": None}
+    try:
+        out["prs"] = pr_review.list_open_prs(repo)
+    except Exception as e:  # noqa: BLE001
+        out["error"] = f"list_prs failed: {e}"
+    try:
+        out["webhook_events"] = pr_review.list_recent_webhook_events(20)
+    except Exception as e:  # noqa: BLE001
+        if not out["error"]:
+            out["error"] = f"webhook_events failed: {e}"
+    return web.json_response(out)
+
+
+async def handle_review_detail(request: web.Request) -> web.Response:
+    """
+    GET /v1/ui/reviews/{number} — PR detail + diff stats + comments.
+    """
+    from agentchat import pr_review
+
+    try:
+        number = int(request.match_info["number"])
+    except ValueError:
+        return web.json_response({"error": "invalid pr number"}, status=400)
+    repo = request.query.get("repo", PR_REVIEW_DEFAULT_REPO)
+    out: dict = {"repo": repo, "number": number, "pr": None, "comments": [], "local": [], "error": None}
+    try:
+        out["pr"] = pr_review.get_pr(repo, number)
+    except Exception as e:  # noqa: BLE001
+        out["error"] = f"get_pr failed: {e}"
+    try:
+        out["comments"] = pr_review.list_comments(repo, number)
+    except Exception as e:  # noqa: BLE001
+        if not out["error"]:
+            out["error"] = f"list_comments failed: {e}"
+    try:
+        out["local"] = pr_review.list_local_comments(repo, number)
+    except Exception as e:  # noqa: BLE001
+        pass
+    return web.json_response(out)
+
+
+async def handle_review_post_comment(request: web.Request) -> web.Response:
+    """
+    POST /v1/ui/reviews/{number}/comments — post a comment.
+
+    Body JSON: {body, path?, line?, in_reply_to?, agent?, repo?, no_post?}
+    """
+    from agentchat import pr_review
+
+    try:
+        number = int(request.match_info["number"])
+    except ValueError:
+        return web.json_response({"error": "invalid pr number"}, status=400)
+    try:
+        payload = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON"}, status=400)
+    body = (payload.get("body") or "").strip()
+    if not body:
+        return web.json_response({"error": "body required"}, status=400)
+    path = payload.get("path")
+    line = payload.get("line")
+    in_reply_to = payload.get("in_reply_to")
+    agent = payload.get("agent")
+    repo = payload.get("repo") or PR_REVIEW_DEFAULT_REPO
+    no_post = bool(payload.get("no_post", False))
+    # Use the session cookie to attribute the comment
+    session_name = request.cookies.get(COOKIE_NAME)
+    if session_name and not agent:
+        agent = session_name
+    try:
+        result = pr_review.post_comment(
+            repo,
+            number,
+            body,
+            path=path,
+            line=line,
+            in_reply_to=in_reply_to,
+            agent=agent,
+            post_to_github=not no_post,
+        )
+    except ValueError as e:
+        return web.json_response({"error": str(e)}, status=400)
+    status_code = 201 if result["status"] == "posted" else (
+        202 if result["status"] == "pending" else 502
+    )
+    return web.json_response(result, status=status_code)
+
+
+async def handle_review_local_comments(request: web.Request) -> web.Response:
+    """GET /v1/ui/reviews/{number}/local-comments?status=posted|pending|failed"""
+    from agentchat import pr_review
+
+    try:
+        number = int(request.match_info["number"])
+    except ValueError:
+        return web.json_response({"error": "invalid pr number"}, status=400)
+    repo = request.query.get("repo", PR_REVIEW_DEFAULT_REPO)
+    status = request.query.get("status")
+    return web.json_response({
+        "repo": repo,
+        "number": number,
+        "comments": pr_review.list_local_comments(repo, number, status=status),
+    })
+
+
+async def handle_github_webhook(request: web.Request) -> web.Response:
+    """
+    POST /v1/webhook/github — receive GitHub webhook events.
+
+    Headers:
+      X-GitHub-Event: pull_request, issues, pull_request_review, etc.
+      X-Hub-Signature-256: HMAC SHA256 (optional; we accept unsigned for now)
+
+    Body: raw JSON payload
+    """
+    from agentchat import pr_review
+
+    event_type = request.headers.get("X-GitHub-Event", "unknown")
+    try:
+        payload = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON"}, status=400)
+    try:
+        event_id = pr_review.record_webhook(event_type, payload)
+    except Exception as e:  # noqa: BLE001
+        log.warning("webhook record failed: %s", e)
+        return web.json_response({"error": str(e)}, status=500)
+    log.info("webhook received: event=%s id=%d repo=%s pr=%s action=%s",
+             event_type, event_id,
+             payload.get("repository", {}).get("full_name") if isinstance(payload.get("repository"), dict) else None,
+             (payload.get("pull_request") or payload.get("issue") or {}).get("number"),
+             payload.get("action"))
+    return web.json_response({"ok": True, "event_id": event_id})
 
 
 # --------------------------------------------------------------------------- #
