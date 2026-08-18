@@ -427,8 +427,9 @@ every push writes an append-only audit log entry, and secrets are scrubbed
 home for change-detection + push with SSH / PAT / GitHub-App auth and
 typed retries. `agentchat-sync` is the convenience CLI that wraps it
 with a one-shot "do everything now" command — useful for cron jobs,
-operators, and first-time setup. Both share the scrubber logic
-(`SCRUB_PATTERNS` in `agentchat/sync_github.py`).
+operators, and first-time setup. Both share the canonical scrubber
+logic (`agentchat/sync_agent/scrubber.py`); `agentchat/sync_github.py`
+re-exports the names for backward compatibility.
 
 **Install.** Already shipped via `pyproject.toml`:
 

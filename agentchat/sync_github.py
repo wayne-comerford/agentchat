@@ -47,7 +47,6 @@ import dataclasses
 import datetime
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -55,6 +54,18 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Iterable
+
+# Re-export the canonical scrubber so legacy callers (sync_cli.py, the
+# test suite, and the original ``agentchat-sync push`` flow) keep working
+# without any import changes. The home of truth is
+# ``agentchat.sync_agent.scrubber`` (v1.2.0.dev22).
+from .sync_agent.scrubber import (  # noqa: F401
+    SCRUB_PATTERNS,
+    NEVER_PUSH_BASENAMES,
+    NEVER_PUSH_PATH_SUBSTRINGS,
+    ScrubStats,
+    scrub_text,
+)
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -82,157 +93,20 @@ DEFAULT_REMOTE_TEMPLATE = "git@github.com:{owner}/{repo}.git"
 # ---------------------------------------------------------------------------
 # Secret scrubbing
 # ---------------------------------------------------------------------------
-
-# Each entry: (label, regex, replacement).
-# Replacement is a sentinel of the form ***REDACTED:<label>*** so the user
-# can see *what* was removed and audit the count, but not the value.
 #
-# Be careful: the regexes run on raw text including YAML/JSON/ENV, so the
-# patterns are deliberately broad and the replacement is verbatim.
-SCRUB_PATTERNS: list[tuple[str, re.Pattern[str], str]] = [
-    # Nostr bech32 secret key (nsec1...). nsec always begins with `nsec1`.
-    (
-        "nostr-nsec",
-        re.compile(r"\bnsec1[ac-hj-np-z02-9]{6,}\b", re.IGNORECASE),
-        "***REDACTED:nostr-nsec***",
-    ),
-    # Generic "private_key" / "nsec" / "secret_key" assignments to hex.
-    (
-        "hex-private-key",
-        re.compile(
-            r"\b(private[_-]?key|nsec[_-]?hex|secret[_-]?key|priv[_-]?hex)"
-            r"\s*[:=]\s*['\"]?([a-f0-9]{32,})['\"]?",
-            re.IGNORECASE,
-        ),
-        r"\1: ***REDACTED:hex-private-key***",
-    ),
-    # GitHub classic PATs: ghp_, gho_, ghu_, ghs_, ghr_
-    (
-        "github-pat",
-        re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b"),
-        "***REDACTED:github-pat***",
-    ),
-    # GitHub fine-grained PATs: github_pat_...
-    (
-        "github-fine-grained-pat",
-        re.compile(r"\bgithub_pat_[A-Za-z0-9_]{22,}\b"),
-        "***REDACTED:github-fine-grained-pat***",
-    ),
-    # Anthropic-style keys MUST come before the generic openai-key pattern,
-    # because sk-ant-... is also matched by \bsk-[...]{20,}\b. Run the
-    # more specific pattern first.
-    (
-        "anthropic-key",
-        re.compile(r"\bsk-ant-[A-Za-z0-9_-]{20,}\b"),
-        "***REDACTED:anthropic-key***",
-    ),
-    # OpenAI / xAI style keys
-    (
-        "openai-key",
-        re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"),
-        "***REDACTED:openai-key***",
-    ),
-    # Slack tokens
-    (
-        "slack-token",
-        re.compile(r"\bxox[bpars]-[A-Za-z0-9-]{10,}\b"),
-        "***REDACTED:slack-token***",
-    ),
-    # Auth bearer tokens in HTTP headers / config
-    (
-        "bearer-token",
-        re.compile(r"(?i)bearer\s+[A-Za-z0-9._\-]{20,}"),
-        "Bearer ***REDACTED:bearer-token***",
-    ),
-    # AUTH_SECRET, SESSION_SECRET, JWT_SECRET assignments
-    (
-        "auth-secret",
-        re.compile(
-            r"\b(AUTH_SECRET|SESSION_SECRET|JWT_SECRET|AGENTCHAT_AUTH_SECRET)"
-            r"\s*[:=]\s*['\"]?[^\s'\"#]{8,}['\"]?",
-            re.IGNORECASE,
-        ),
-        r"\1=***REDACTED:auth-secret***",
-    ),
-    # Generic password assignments. Intentionally conservative: must be a key
-    # word followed by a value of at least 8 chars; avoids redacting prose.
-    (
-        "password",
-        re.compile(
-            r"(?i)\b(password|passwd|pwd)\b\s*[:=]\s*['\"]?([^\s'\"<>#]{8,})['\"]?",
-        ),
-        r"\1: ***REDACTED:password***",
-    ),
-    # OAuth tokens (gho_ is already covered, but capture broader patterns)
-    (
-        "oauth-token",
-        re.compile(r"\b(oauth_token|access_token|refresh_token)\b\s*[:=]\s*['\"]?[A-Za-z0-9._\-]{12,}['\"]?", re.IGNORECASE),
-        r"\1: ***REDACTED:oauth-token***",
-    ),
-]
+# The regex table, file-skip list, path-skip list, ``ScrubStats`` data class
+# and ``scrub_text()`` function all live in ``agentchat.sync_agent.scrubber``
+# (v1.2.0.dev22). This module re-exports them for backward compatibility so
+# ``sg.scrub_text`` / ``sg.SCRUB_PATTERNS`` / ``sg.ScrubStats`` keep working.
+#
+# The pattern-ordering contract (``sk-ant-...`` BEFORE generic ``sk-...``) is
+# enforced by the canonical module — see the long docstring at the top of
+# ``agentchat/sync_agent/scrubber.py``.
 
-
-# Files we never even attempt to scrub — we never copy them to the mirror
-# in the first place. These are matched against the file's *basename* AND
-# against the substring of the path.
-NEVER_PUSH_BASENAMES: frozenset[str] = frozenset(
-    {
-        # Nostr private keys (per-agent JSON sidecar files)
-        "*.nsec.json",
-        # Generic secret dumps
-        "secrets.json",
-        "secrets.yaml",
-        "secrets.yml",
-        "secrets.env",
-        ".env",
-        ".env.local",
-        ".env.production",
-        # SSH / git credentials
-        "id_rsa",
-        "id_ed25519",
-        ".netrc",
-        # Tokens caches
-        "tokens.json",  # backplane tokens; agentchat-specific, never push
-        # Python
-        "*.pyc",
-        "__pycache__",
-    }
-)
-
-# Substrings inside the full path that disqualify a file outright. These
-# protect against directory walks accidentally including cache trees.
-NEVER_PUSH_PATH_SUBSTRINGS: tuple[str, ...] = (
-    "/__pycache__/",
-    "/.git/",
-    "/node_modules/",
-    "/.venv/",
-    "/venv/",
-    "/.cache/",
-    "/archive/",  # local snapshot dir under memory/archive — not for mirror
-)
 
 # ---------------------------------------------------------------------------
 # Data classes
 # ---------------------------------------------------------------------------
-
-
-@dataclasses.dataclass
-class ScrubStats:
-    """Counts of how many secrets were redacted, by category."""
-
-    counts: dict[str, int] = dataclasses.field(default_factory=dict)
-    total_lines_scanned: int = 0
-    total_lines_changed: int = 0
-
-    def bump(self, label: str, n: int = 1) -> None:
-        self.counts[label] = self.counts.get(label, 0) + n
-
-    def to_dict(self) -> dict:
-        return {
-            "counts": dict(self.counts),
-            "total_lines_scanned": self.total_lines_scanned,
-            "total_lines_changed": self.total_lines_changed,
-        }
 
 
 @dataclasses.dataclass
@@ -252,27 +126,10 @@ class SyncResult:
 # ---------------------------------------------------------------------------
 # Scrubber
 # ---------------------------------------------------------------------------
-
-
-def scrub_text(text: str, stats: ScrubStats | None = None) -> str:
-    """Apply every pattern in SCRUB_PATTERNS to *text*, returning scrubbed text.
-
-    If *stats* is provided, bump counters on every match. The function is
-    idempotent: scrubbing a string that has no secrets returns it unchanged.
-    """
-    if stats is not None:
-        stats.total_lines_scanned += text.count("\n") + 1
-
-    out = text
-    for label, pat, repl in SCRUB_PATTERNS:
-        out, n = pat.subn(repl, out)
-        if n and stats is not None:
-            stats.bump(label, n)
-
-    if stats is not None and out != text:
-        stats.total_lines_changed += text.count("\n") + 1
-
-    return out
+#
+# ``scrub_text`` is re-exported from ``agentchat.sync_agent.scrubber`` at
+# the top of this file. See that module for the regex table and the
+# pattern-ordering contract.
 
 
 def should_skip_path(path: Path) -> bool:

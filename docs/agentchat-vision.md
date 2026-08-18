@@ -191,7 +191,8 @@ live where they live; the hub just gives them a place to be seen.
 |---|---|---|---|
 | **v1.2.0.dev19** ✅ | Add Agent wizard | `POST /v1/ui/agents` atomic create + memory paste/upload + preview | 414 |
 | **v1.2.0.dev20** ✅ | GitHub sync (one-shot) | `agentchat-sync push` — scrubber, mirror tree, audit log, SSH/PAT transport | 527 |
-| **v1.2.0.dev21** | GitHub sync (daemon) | `agentchat-sync watch` — auto-push on memory change; detach/status/stop; PID file + signals | 557 |
+| **v1.2.0.dev21** ✅ | GitHub sync (daemon) | `agentchat-sync watch` — auto-push on memory change; detach/status/stop; PID file + signals | 557 |
+| **v1.2.0.dev22** | Scrubber refactor | Lifted `SCRUB_PATTERNS` + `scrub_text` + `ScrubStats` + skip-lists into `agentchat/sync_agent/scrubber.py` (canonical home); `sync_github.py` is now a thin re-export shim. 31 new unit tests for ordering, idempotency, and zero-false-positives on prose. | 588 |
 | **v1.3.0** | Multi-tenant | Workspaces + Nostr-pubkey auth + user accounts + federation tokens | 700 |
 | **v1.3.0** | Self-hostable | Docker image + docker-compose + Helm chart + `/healthz` + SIGTERM | (covered above) |
 | **v1.3.0** | Hosted | Caddy + Postgres + S3 + Terraform + status page | (ops doc) |
