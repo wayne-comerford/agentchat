@@ -55,6 +55,7 @@ from agentchat.nostr.client import RelayPool  # noqa: E402
 from agentchat.nostr.events import build_channel_message  # noqa: E402
 from agentchat.nostr.keys import NostrKeys, load_keys  # noqa: E402
 from agentchat import memory as memory_store  # noqa: E402
+from agentchat import memory_import  # noqa: E402
 
 # Per-agent keypair registry (loaded lazily).
 # Path is overridable via AGENTCHAT_NOSTR_DIR for tests.
@@ -439,6 +440,290 @@ async def handle_memory_import(request: web.Request) -> web.Response:
         agent, source, mode, session_name, len(summary.get("files_imported", [])),
     )
     return web.json_response(summary)
+
+
+# --------------------------------------------------------------------------- #
+# Memory import — single-file (paste / upload) + atomic agent create
+# (Powers the Add Agent wizard. See kanban t_20f29edb.)
+# --------------------------------------------------------------------------- #
+
+def _save_registry(state: "BridgeState") -> None:
+    """Atomically persist the in-memory agent registry to disk.
+
+    Writes to ``<registry>.tmp`` then ``os.replace`` so a crash mid-write
+    can't corrupt the live registry.
+    """
+    p = _registry_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(f"{p.name}.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state.registry, f, indent=2, sort_keys=True)
+    os.replace(tmp, p)
+
+
+async def handle_memory_preview(request: web.Request) -> web.Response:
+    """GET /v1/ui/memory/preview — parse a memory.md body and return counts.
+
+    Read-only, no auth required (parsing is a pure function on the input
+    text; nothing is written). Used by the Add Agent modal to show
+    live preview as the user types.
+
+    Body: {"memory_md": "..."}    OR    raw text body (Content-Type:
+    text/markdown).
+
+    Response: 200 with :func:`memory_import.parse_memory_md` result.
+    """
+    ctype = (request.headers.get("Content-Type") or "").split(";")[0].strip()
+    if ctype == "application/json":
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "invalid JSON"}, status=400)
+        text = (body or {}).get("memory_md", "")
+    else:
+        # text/markdown or application/octet-stream
+        text = await request.text()
+
+    if not isinstance(text, str):
+        return web.json_response({"error": "memory_md must be a string"}, status=400)
+    if len(text.encode("utf-8")) > memory_import.MAX_UPLOAD_BYTES:
+        return web.json_response(
+            {"error": f"input exceeds {memory_import.MAX_UPLOAD_BYTES} bytes"},
+            status=413,
+        )
+
+    parsed = memory_import.parse_memory_md(text)
+    return web.json_response(parsed.to_dict())
+
+
+async def handle_agent_import_memory(request: web.Request) -> web.Response:
+    """POST /v1/ui/agents/import-memory — replace an existing agent's memory.
+
+    Two content types:
+
+      * ``application/json`` — body has ``{"agent": "<name>", "memory_md": "..."}``.
+        Capped at 64 KiB. Used by the inline paste in the standalone
+        "Import memory" button on each agent card.
+      * ``multipart/form-data`` — fields ``agent`` (str) + ``file``
+        (uploaded .md). Capped at 256 KiB. Used by the upload flow.
+
+    Auth: session required. Any logged-in local user can import memory
+    into any agent — workspace ACLs (v1.3.0) will tighten this.
+
+    Response: 200 with :func:`memory_import.import_text` /
+    :func:`memory_import.import_file` result.
+    """
+    session_name = request.cookies.get(COOKIE_NAME)
+    if not session_name:
+        return web.json_response({"error": "login required"}, status=401)
+
+    ctype = (request.headers.get("Content-Type") or "").split(";")[0].strip()
+    state = get_state(request.app)
+
+    if ctype == "application/json":
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "invalid JSON"}, status=400)
+        agent = (body or {}).get("agent", "").strip()
+        text = (body or {}).get("memory_md", "")
+        if not agent:
+            return web.json_response({"error": "agent required"}, status=400)
+        if not text:
+            return web.json_response({"error": "memory_md required"}, status=400)
+        try:
+            result = memory_import.import_text(agent, text)
+        except memory_import.OversizeInput as e:
+            return web.json_response(
+                {"error": str(e), "size": e.size, "cap": e.cap}, status=413
+            )
+        except memory_import.InvalidAgentName as e:
+            return web.json_response({"error": str(e)}, status=400)
+        except Exception as e:
+            log.warning("agent/import-memory failed: agent=%s err=%s", agent, e)
+            return web.json_response({"error": str(e)}, status=500)
+    elif ctype.startswith("multipart/"):
+        try:
+            form = await request.post()
+        except Exception as e:
+            return web.json_response({"error": f"invalid multipart: {e}"}, status=400)
+        # aiohttp returns MultiDict; .get returns str | FileField.
+        raw_agent = form.get("agent") if form is not None else None
+        agent = (str(raw_agent) if raw_agent is not None else "").strip()
+        if not agent:
+            return web.json_response({"error": "agent required"}, status=400)
+        file_field = form.get("file") if form is not None else None
+        # aiohttp's FileField has a .file attribute; plain str fields don't.
+        if file_field is None or not hasattr(file_field, "file"):
+            return web.json_response(
+                {"error": "file field required (multipart)"}, status=400
+            )
+        # Read the upload into a temp file so we can stream it through
+        # import_file() with the size cap check.
+        import tempfile
+        with tempfile.NamedTemporaryFile(
+            prefix="agentchat-memimport-",
+            suffix=".md",
+            delete=False,
+        ) as tmp:
+            tmp.write(file_field.file.read())
+            tmp_path = Path(tmp.name)
+        try:
+            result = memory_import.import_file(agent, tmp_path)
+        except memory_import.OversizeInput as e:
+            return web.json_response(
+                {"error": str(e), "size": e.size, "cap": e.cap}, status=413
+            )
+        except memory_import.InvalidAgentName as e:
+            return web.json_response({"error": str(e)}, status=400)
+        except Exception as e:
+            log.warning("agent/import-memory upload failed: agent=%s err=%s", agent, e)
+            return web.json_response({"error": str(e)}, status=500)
+        finally:
+            tmp_path.unlink(missing_ok=True)
+    else:
+        return web.json_response(
+            {"error": "Content-Type must be application/json or multipart/form-data"},
+            status=415,
+        )
+
+    log.info(
+        "agent/import-memory ok: agent=%s sections=%d lines=%d by=%s",
+        result.agent, result.sections_imported, result.lines_imported, session_name,
+    )
+    return web.json_response(result.to_dict())
+
+
+async def handle_create_agent(request: web.Request) -> web.Response:
+    """POST /v1/ui/agents — create a new agent (and optionally import memory).
+
+    Body: {
+      "name": "<agent name>",                # required, alphanumeric + -_
+      "npub": "npub1...",                    # optional
+      "public_key_hex": "<64 hex chars>",    # optional
+      "color": "#a78bfa",                    # optional
+      "role": "member" | "admin",            # optional, default member
+      "memory_md": "## Identity\\n- ...",    # optional; atomic with create
+      "source_ecosystem": "local" | "..."    # optional; metadata for v1.3
+    }
+
+    Auth: session required. Atomic — if memory import fails, the agent
+    is NOT created and the registry is unchanged.
+
+    Response 200: {"ok": true, "agent": {...}, "memory": {...}}
+    Response 400: validation
+    Response 401: no session
+    Response 409: name already exists
+    Response 413: memory_md too large
+    """
+    session_name = request.cookies.get(COOKIE_NAME)
+    if not session_name:
+        return web.json_response({"error": "login required"}, status=401)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON"}, status=400)
+    if not isinstance(body, dict):
+        return web.json_response({"error": "body must be a JSON object"}, status=400)
+
+    name = (body.get("name") or "").strip()
+    npub = (body.get("npub") or "").strip() or None
+    public_key_hex = (body.get("public_key_hex") or "").strip() or None
+    color = (body.get("color") or "").strip() or None
+    role = (body.get("role") or "member").strip()
+    memory_md = body.get("memory_md")
+    source_ecosystem = (body.get("source_ecosystem") or "local").strip()
+
+    if not name:
+        return web.json_response({"error": "name required"}, status=400)
+    if role not in ("member", "admin", "observer"):
+        return web.json_response(
+            {"error": "role must be member|admin|observer"}, status=400
+        )
+
+    state = get_state(request.app)
+    if name in state.registry:
+        return web.json_response(
+            {"error": f"agent {name!r} already exists"}, status=409
+        )
+
+    # Validate the memory before mutating anything so we can fail fast
+    # without rolling back. Memory text is optional — None means "no
+    # memory yet" (the Add Agent modal's first radio option).
+    import_result: dict | None = None
+    if memory_md is not None:
+        if not isinstance(memory_md, str):
+            return web.json_response(
+                {"error": "memory_md must be a string"}, status=400
+            )
+        try:
+            import_result = memory_import.import_text(name, memory_md).to_dict()
+        except memory_import.OversizeInput as e:
+            return web.json_response(
+                {"error": str(e), "size": e.size, "cap": e.cap}, status=413
+            )
+        except memory_import.InvalidAgentName as e:
+            return web.json_response({"error": str(e)}, status=400)
+
+    # Build the registry entry. We don't have the agent's real
+    # secret key on this side (the agent's own daemon does), so we
+    # only persist what's discoverable from the public side: name,
+    # public npub, public key hex, color, role, and the metadata
+    # tags needed for the federation vision.
+    entry: dict[str, Any] = {
+        "npub": npub,
+        "public_key_hex": public_key_hex,
+        "color": color,
+        "role": role,
+        "source_ecosystem": source_ecosystem,
+        "added_at": int(time.time()),
+        "added_by": session_name,
+    }
+    # Drop None values so the on-disk registry stays minimal.
+    entry = {k: v for k, v in entry.items() if v is not None}
+
+    # Atomic: write the registry entry + (optionally) the memory.
+    # Memory has already been written by import_text() above if it
+    # was provided. Registry is the only remaining mutation.
+    state.registry[name] = entry
+    try:
+        _save_registry(state)
+    except Exception as e:
+        # Roll back memory if we wrote it.
+        if import_result is not None:
+            try:
+                target = memory_store.agent_memory_path(name)
+                if target.exists():
+                    target.unlink()
+            except Exception:
+                pass
+        state.registry.pop(name, None)
+        log.error("agent create: registry save failed: %s", e)
+        return web.json_response(
+            {"error": f"failed to persist registry: {e}"}, status=500
+        )
+
+    log.info(
+        "agent create ok: name=%s role=%s by=%s memory=%s",
+        name, role, session_name, "yes" if import_result else "no",
+    )
+    # Build the response in the same shape as GET /v1/ui/agents.
+    response_entry = {
+        "name": name,
+        "npub": entry.get("npub"),
+        "public_key_hex": entry.get("public_key_hex"),
+        "status_entry": None,
+        "role": entry.get("role"),
+        "color": entry.get("color"),
+        "source_ecosystem": entry.get("source_ecosystem"),
+        "added_at": entry.get("added_at"),
+    }
+    return web.json_response({
+        "ok": True,
+        "agent": response_entry,
+        "memory": import_result,
+    })
 
 
 # --------------------------------------------------------------------------- #
@@ -1223,6 +1508,9 @@ def make_app(config: dict) -> web.Application:
     app.router.add_get("/static/{path:.*}", handle_static)
     app.router.add_get("/v1/ui/channels", handle_channels)
     app.router.add_get("/v1/ui/agents", handle_agents)
+    app.router.add_post("/v1/ui/agents", handle_create_agent)
+    app.router.add_post("/v1/ui/agents/import-memory", handle_agent_import_memory)
+    app.router.add_get("/v1/ui/memory/preview", handle_memory_preview)
     app.router.add_get("/v1/ui/focus", handle_focus_get)
     app.router.add_post("/v1/ui/focus", handle_focus_post)
     app.router.add_get("/v1/ui/stream", handle_stream)
