@@ -23,6 +23,8 @@ function workspace() {
     mentionSelected: 0,
     mentionQuery: '',
     eventSource: null,
+    sidebarOpen: false,          // mobile sidebar drawer; auto-closes on select
+    isMobile: false,             // window.matchMedia('(max-width: 767px)')
 
     // ─────────── Memories drawer ───────────
     memoriesOpen: false,
@@ -67,6 +69,15 @@ function workspace() {
         const preferred = this.channels.find(c => c.id === 'general') || this.channels[0];
         this.selectChannel(preferred);
       }
+      // Track mobile viewport so we can auto-close the sidebar drawer
+      // when something is selected, and keep the sidebar hidden if the
+      // window is resized to desktop.
+      const mq = window.matchMedia('(max-width: 767px)');
+      this.isMobile = mq.matches;
+      mq.addEventListener('change', (e) => {
+        this.isMobile = e.matches;
+        if (!e.matches) this.sidebarOpen = false;
+      });
     },
 
     // ─────────── auth ───────────
@@ -103,18 +114,24 @@ function workspace() {
 
     // ─────────── selection ───────────
     selectChannel(ch) {
-      if (this.activeChannel?.id === ch.id) return;
+      if (this.activeChannel?.id === ch.id) {
+        // Tapping the active channel on mobile just closes the drawer.
+        if (this.isMobile) this.sidebarOpen = false;
+        return;
+      }
       this.activeChannel = ch;
       this.activeAgent = null;
       this.messages = [];
       this.unread[ch.id] = 0;
       this.attachStream();
+      if (this.isMobile) this.sidebarOpen = false;
     },
 
     selectAgent(a) {
       this.activeAgent = a;
       this.activeChannel = null;
       this.detachStream();
+      if (this.isMobile) this.sidebarOpen = false;
     },
 
     // ─────────── agent_status SSE ───────────

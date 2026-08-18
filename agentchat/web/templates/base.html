@@ -2,7 +2,10 @@
 <html lang="en" class="h-full bg-slate-950 text-slate-100">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="theme-color" content="#0b0e14" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <title>agentchat v1.2 — workspace</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E⚡%3C/text%3E%3C/svg%3E" />
 
@@ -43,15 +46,43 @@
 </head>
 
 <body
-  class="h-screen overflow-hidden font-sans antialiased"
+  class="h-[100dvh] max-h-[100dvh] overflow-hidden font-sans antialiased"
   x-data="workspace()"
   x-init="boot()"
+  style="padding-top: env(safe-area-inset-top); padding-left: env(safe-area-inset-left); padding-right: env(safe-area-inset-right);"
 >
 
-  <div class="flex h-screen overflow-hidden">
+  <div class="flex h-full overflow-hidden relative">
 
-    <!-- ─────────────────────────── SIDEBAR ─────────────────────────── -->
-    <aside class="w-64 bg-surface-800 border-r border-surface-700 flex flex-col">
+    <!-- ─────────────────────────── SIDEBAR (drawer on mobile) ─────────────────────────── -->
+    <!-- Backdrop: only on mobile when sidebar open -->
+    <div
+      x-show="sidebarOpen"
+      x-transition:enter="transition-opacity ease-out duration-200"
+      x-transition:enter-start="opacity-0"
+      x-transition:enter-end="opacity-100"
+      x-transition:leave="transition-opacity ease-in duration-150"
+      x-transition:leave-start="opacity-100"
+      x-transition:leave-end="opacity-0"
+      @click="sidebarOpen = false"
+      class="md:hidden fixed inset-0 bg-black/60 z-30"
+      style="-webkit-tap-highlight-color: transparent;"
+    ></div>
+
+    <aside
+      x-bind:class="sidebarOpen
+        ? 'translate-x-0'
+        : '-translate-x-full md:translate-x-0'"
+      x-transition:enter="transition-transform ease-out duration-200"
+      x-transition:enter-start="-translate-x-full"
+      x-transition:enter-end="translate-x-0"
+      x-transition:leave="transition-transform ease-in duration-150"
+      x-transition:leave-start="translate-x-0"
+      x-transition:leave-end="-translate-x-full"
+      class="w-64 bg-surface-800 border-r border-surface-700 flex flex-col
+             fixed inset-y-0 left-0 z-40
+             md:relative md:inset-auto md:z-auto md:translate-x-0 md:transition-none"
+    >
 
       <!-- Workspace header -->
       <div class="h-14 flex items-center px-4 border-b border-surface-700 bg-surface-900">
@@ -181,7 +212,19 @@
     <main class="flex-1 min-h-0 flex flex-col bg-surface-900 min-w-0 overflow-hidden">
 
       <!-- Channel header -->
-      <header class="h-14 flex-none px-5 border-b border-surface-700 flex items-center bg-surface-800/60 backdrop-blur">
+      <header class="h-14 flex-none px-4 md:px-5 border-b border-surface-700 flex items-center bg-surface-800/60 backdrop-blur gap-2">
+        <!-- Hamburger: visible only on mobile (< md) -->
+        <button
+          @click="sidebarOpen = true"
+          class="md:hidden flex-none w-9 h-9 -ml-1 rounded-md hover:bg-surface-700 text-slate-300 hover:text-slate-100 flex items-center justify-center"
+          aria-label="Open menu"
+          title="Open menu"
+          style="-webkit-tap-highlight-color: transparent;"
+        >
+          <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/>
+          </svg>
+        </button>
         <template x-if="activeChannel">
           <div class="flex items-center min-w-0">
             <span class="text-slate-500 mr-1">#</span>
@@ -237,7 +280,7 @@
       </header>
 
       <!-- Message stream -->
-      <section class="flex-1 min-h-0 overflow-y-auto px-5 py-4 space-y-3" x-ref="stream"
+      <section class="flex-1 min-h-0 overflow-y-auto px-3 md:px-5 py-3 md:py-4 space-y-3" x-ref="stream"
         @scroll="onStreamScroll($event)"
       >
         <template x-if="!activeChannel && (!activeAgent || !activeAgent.name)">
@@ -279,17 +322,19 @@
       </section>
 
       <!-- Post box -->
-      <footer class="flex-none border-t border-surface-700 px-5 py-3 bg-surface-800/40">
+      <footer class="flex-none border-t border-surface-700 px-3 md:px-5 py-3 bg-surface-800/40"
+              style="padding-bottom: max(0.75rem, env(safe-area-inset-bottom));">
         <template x-if="activeChannel">
-          <form @submit.prevent="postMessage()" class="flex gap-2 items-start">
+          <form @submit.prevent="postMessage()" class="flex gap-2 items-end">
             <div class="flex-1 relative">
               <textarea
                 x-model="draft"
                 @keydown.enter.exact.prevent="postMessage()"
                 @input="updateMentionSuggestions($event)"
-                placeholder="Type a message — Enter to send, Shift+Enter for newline. Use @agent-name to mention."
+                placeholder="Type a message — Enter to send"
                 rows="1"
-                class="w-full bg-surface-700 border border-surface-600 rounded-md px-3 py-2 text-sm placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-sky-500/40 focus:border-sky-500/50 resize-none max-h-32"
+                class="w-full bg-surface-700 border border-surface-600 rounded-md px-3 py-2 text-base md:text-sm placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-sky-500/40 focus:border-sky-500/50 resize-none max-h-32"
+                style="font-size: 16px;"
               ></textarea>
 
               <!-- Mention autocomplete dropdown -->
@@ -339,20 +384,42 @@
       </footer>
     </main>
 
-    <!-- ─────────────────────────── MEMORIES DRAWER (right) ─────────────── -->
+    <!-- ─────────────────────────── MEMORIES DRAWER (bottom sheet on mobile, right rail on desktop) ─────────────── -->
+    <!-- Mobile backdrop -->
+    <div
+      x-show="memoriesOpen"
+      x-transition:enter="transition-opacity ease-out duration-200"
+      x-transition:enter-start="opacity-0"
+      x-transition:enter-end="opacity-100"
+      x-transition:leave="transition-opacity ease-in duration-150"
+      x-transition:leave-start="opacity-100"
+      x-transition:leave-end="opacity-0"
+      @click="memoriesOpen = false"
+      class="md:hidden fixed inset-0 bg-black/60 z-30"
+      style="-webkit-tap-highlight-color: transparent;"
+    ></div>
+
     <aside
       x-show="memoriesOpen"
-      x-transition:enter="transition ease-out duration-200"
-      x-transition:enter-start="translate-x-full"
-      x-transition:enter-end="translate-x-0"
-      x-transition:leave="transition ease-in duration-150"
-      x-transition:leave-start="translate-x-0"
-      x-transition:leave-end="translate-x-full"
-      class="w-96 bg-surface-800 border-l border-surface-700 flex-none flex flex-col overflow-hidden"
+      x-transition:enter="transition-transform ease-out duration-200"
+      x-transition:enter-start="translate-y-full md:translate-y-0 md:translate-x-full"
+      x-transition:enter-end="translate-y-0 md:translate-x-0"
+      x-transition:leave="transition-transform ease-in duration-150"
+      x-transition:leave-start="translate-y-0 md:translate-x-0"
+      x-transition:leave-end="translate-y-full md:translate-y-0 md:translate-x-full"
+      class="bg-surface-800 border-surface-700 flex-none flex flex-col overflow-hidden
+             fixed inset-x-0 bottom-0 top-16 z-40
+             md:static md:z-auto md:w-96 md:border-l md:translate-y-0 md:transition-none
+             rounded-t-2xl md:rounded-none"
+      style="padding-bottom: env(safe-area-inset-bottom);"
       @keydown.escape.window="memoriesOpen = false"
     >
+      <!-- Drag handle (mobile only, decorative) -->
+      <div class="md:hidden flex-none flex justify-center pt-2 pb-1">
+        <div class="w-10 h-1 rounded-full bg-surface-600"></div>
+      </div>
       <!-- Drawer header -->
-      <header class="h-14 px-5 border-b border-surface-700 flex items-center bg-surface-800/60 backdrop-blur flex-none">
+      <header class="h-14 px-4 md:px-5 border-b border-surface-700 flex items-center bg-surface-800/60 backdrop-blur flex-none">
         <div class="flex-1">
           <h2 class="text-sm font-semibold flex items-center gap-2">
             <span>🧠</span>
