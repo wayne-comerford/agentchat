@@ -286,6 +286,7 @@ def watch_and_commit(
     commit_stage: CommitStage | None = None,
     emitter: ChangeEmitter | None = None,
     poll_interval_seconds: float = 1.0,
+    on_commit: Callable[[CommitResult], None] | None = None,
 ) -> CommitResult | None:
     """Run the watch-and-commit loop.
 
@@ -294,7 +295,16 @@ def watch_and_commit(
       asserts on.
     * ``once=False`` → loop forever, polling every
       ``poll_interval_seconds``. Each detected change triggers a
-      debounced commit. The daemon mode in t_0105ff20 will own this.
+      debounced commit.
+
+    ``on_commit`` (optional) — invoked after each successful commit
+    (whether from ``once=True`` or the daemon loop). Receives the
+    ``CommitResult``. The dev21 ``agentchat-sync watch`` CLI uses
+    this hook to push the just-landed commit to GitHub. Exceptions
+    raised by ``on_commit`` are logged but do not stop the loop;
+    callers that want hard failure semantics should raise inside
+    ``on_commit`` and handle the consequence in their own daemon
+    lifecycle (PID file removal, exit code, etc.).
 
     Returns the ``CommitResult`` of the final commit (whether from
     ``once=True`` or the last loop iteration in daemon mode). In
@@ -312,21 +322,28 @@ def watch_and_commit(
             if has_uncommitted_changes(config.repo_dir):
                 result = stage.run_once()
                 _maybe_reset_baseline(emitter, result)
+                if on_commit is not None and result.committed:
+                    _safe_invoke_on_commit(on_commit, result)
                 return result
             return None
         result = stage.run(change)
         _maybe_reset_baseline(emitter, result)
+        if on_commit is not None and result.committed:
+            _safe_invoke_on_commit(on_commit, result)
         return result
 
-    # Daemon mode — left here as a thin loop; t_0105ff20 will replace
-    # this with the proper orchestrator that wires the lockfile, the
-    # push stage, and signal handling.
+    # Daemon mode — the dev21 watch CLI owns the lockfile, push stage,
+    # and signal handling on top of this loop. This function provides
+    # the polling+debounce+commit primitives; the caller decides what
+    # to do with the resulting CommitResult.
     log.info("watch_and_commit daemon mode starting (poll=%.1fs)", poll_interval_seconds)
     last_commit: CommitResult | None = None
 
     def _on_change(change: ChangeSet) -> None:
         nonlocal last_commit
         last_commit = _safe_commit(stage, emitter, change)
+        if on_commit is not None and last_commit.committed:
+            _safe_invoke_on_commit(on_commit, last_commit)
 
     debouncer = DebouncedEmitter(
         emitter,
@@ -374,3 +391,28 @@ def _safe_commit(
         log.info("committed %s: %s", (result.sha or "?")[:8], change.summary_line())
         _maybe_reset_baseline(emitter, result)
     return result
+
+
+def _safe_invoke_on_commit(
+    on_commit: Callable[[CommitResult], None],
+    result: CommitResult,
+) -> None:
+    """Invoke the user-supplied ``on_commit`` callback with a guard.
+
+    Exceptions raised by ``on_commit`` are logged but do not propagate.
+    The rationale: the watch loop is responsible for keeping the
+    daemon alive across long stretches of quiet, and a downstream
+    push failure must not be allowed to kill the polling+commit
+    pipeline. Callers that need to react hard to ``on_commit``
+    failure should signal that through their own state (a metric,
+    an audit log entry, a callback that sends a Telegram message,
+    etc.) rather than by raising — raising here would terminate
+    the daemon.
+    """
+    try:
+        on_commit(result)
+    except Exception:
+        log.exception(
+            "on_commit callback raised after commit %s; daemon continues",
+            (result.sha or "?")[:8],
+        )

@@ -98,6 +98,93 @@ def build_parser() -> argparse.ArgumentParser:
     sp_audit_show.add_argument("ts", help="Timestamp substring to match (e.g. 2026-08-18T12:34:56).")
     sp_audit_show.set_defaults(func=cmd_audit_show)
 
+    sp_watch = sub.add_parser(
+        "watch",
+        help="Watch memory tree for changes; auto-push to GitHub on debounce.",
+        description=(
+            "Run a long-lived daemon that watches the Hermes memory tree and "
+            "auto-pushes to GitHub whenever files change. A debounce window "
+            "coalesces bursts of writes into a single push, and a minimum "
+            "push interval prevents hammering GitHub. Use --detach to run in "
+            "the background; use --stop to shut down a running daemon."
+        ),
+    )
+    sp_watch.add_argument(
+        "--foreground",
+        action="store_true",
+        default=True,
+        help="Run in the foreground (default; this is the normal way to run).",
+    )
+    sp_watch.add_argument(
+        "--detach",
+        action="store_true",
+        help="Fork into the background, write PID file, log to ~/.hermes/sync/watch.log.",
+    )
+    sp_watch.add_argument(
+        "--stop",
+        action="store_true",
+        help="Send SIGTERM to the running daemon (if any) and wait for clean shutdown.",
+    )
+    sp_watch.add_argument(
+        "--status",
+        action="store_true",
+        help="Report whether a watch daemon is currently running.",
+    )
+    sp_watch.add_argument(
+        "--mirror-root",
+        default=None,
+        help="Override the mirror root (default: ~/.hermes/sync/mirror/<workspace>).",
+    )
+    sp_watch.add_argument(
+        "--watched-root",
+        action="append",
+        default=None,
+        help=(
+            "Override a watched filesystem root (repeatable). Default: "
+            "~/.hermes/memory. Tilde-expanded."
+        ),
+    )
+    sp_watch.add_argument(
+        "--config",
+        default=None,
+        help="Path to a YAML config file (default: ~/.hermes/sync/config.yaml).",
+    )
+    sp_watch.add_argument(
+        "--pid-file",
+        default=None,
+        help="Path to the daemon PID file (default: ~/.hermes/sync/watch.pid).",
+    )
+    sp_watch.add_argument(
+        "--log-file",
+        default=None,
+        help="Path to the daemon log file when --detach is used.",
+    )
+    sp_watch.add_argument(
+        "--debounce-seconds",
+        type=float,
+        default=None,
+        help="Coalesce bursts of writes within this many seconds (default: 5.0).",
+    )
+    sp_watch.add_argument(
+        "--poll-interval-seconds",
+        type=float,
+        default=None,
+        help="Filesystem poll cadence (default: 1.0s; min effective 0.5s for SIGTERM response).",
+    )
+    sp_watch.add_argument(
+        "--min-push-interval-seconds",
+        type=float,
+        default=None,
+        help="Minimum seconds between pushes (default: 30.0).",
+    )
+    sp_watch.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Logging verbosity (default: INFO).",
+    )
+    sp_watch.set_defaults(func=cmd_watch)
+
     return p
 
 
@@ -306,6 +393,69 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     return args.func(args)
+
+
+def cmd_watch(args: argparse.Namespace) -> int:
+    """``agentchat-sync watch`` — run the watch daemon.
+
+    The arg namespace has the union of all subcommand flags. The
+    dispatcher below splits the three control-plane sub-modes
+    (--stop, --status, --detach) from the default run-in-foreground
+    mode. Each control-plane mode has a one-shot lifecycle: read PID,
+    signal, exit. The foreground mode runs the daemon loop in the
+    calling process until SIGTERM/SIGINT.
+    """
+    import logging as _logging
+    from .watch import (
+        WatchConfig,
+        WatchDaemon,
+        cmd_watch_detach as _watch_detach,
+        cmd_watch_status as _watch_status,
+        cmd_watch_stop as _watch_stop,
+        load_config,
+    )
+
+    # Configure logging before any branch so the dispatch itself is
+    # visible in the log file when detached.
+    _logging.basicConfig(
+        level=getattr(_logging, args.log_level),
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    )
+
+    # Load the YAML config first, then layer CLI overrides on top so
+    # any explicit flag wins over the config file.
+    config_path = Path(args.config).expanduser() if args.config else None
+    cfg = load_config(config_path)
+
+    if args.mirror_root:
+        cfg.mirror_root = Path(args.mirror_root).expanduser()
+    if args.watched_root:
+        cfg.watched_roots = tuple(Path(r).expanduser() for r in args.watched_root)
+    if args.pid_file:
+        cfg.pid_file = Path(args.pid_file).expanduser()
+    if args.log_file:
+        cfg.log_file = Path(args.log_file).expanduser()
+    if args.debounce_seconds is not None:
+        cfg.debounce_seconds = float(args.debounce_seconds)
+    if args.poll_interval_seconds is not None:
+        cfg.poll_interval_seconds = float(args.poll_interval_seconds)
+    if args.min_push_interval_seconds is not None:
+        cfg.min_push_interval_seconds = float(args.min_push_interval_seconds)
+    if args.workspace:
+        cfg.workspace_slug = args.workspace
+
+    # Dispatch on the control-plane sub-modes. Each is mutually
+    # exclusive with the others and with foreground mode.
+    if args.status:
+        return _watch_status(cfg)
+    if args.stop:
+        return _watch_stop(cfg)
+    if args.detach:
+        return _watch_detach(cfg)
+
+    # Default: run the loop in the foreground.
+    daemon = WatchDaemon(cfg)
+    return daemon.run_foreground()
 
 
 if __name__ == "__main__":

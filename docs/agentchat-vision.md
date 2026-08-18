@@ -190,7 +190,8 @@ live where they live; the hub just gives them a place to be seen.
 | Version | Slice | What's new | Tests target |
 |---|---|---|---|
 | **v1.2.0.dev19** ✅ | Add Agent wizard | `POST /v1/ui/agents` atomic create + memory paste/upload + preview | 414 |
-| **v1.2.0.dev20** | GitHub sync | `agentchat sync-agent` subprocess; auto-commit memory changes; PR review flow | 450 |
+| **v1.2.0.dev20** ✅ | GitHub sync (one-shot) | `agentchat-sync push` — scrubber, mirror tree, audit log, SSH/PAT transport | 527 |
+| **v1.2.0.dev21** | GitHub sync (daemon) | `agentchat-sync watch` — auto-push on memory change; detach/status/stop; PID file + signals | 557 |
 | **v1.3.0** | Multi-tenant | Workspaces + Nostr-pubkey auth + user accounts + federation tokens | 700 |
 | **v1.3.0** | Self-hostable | Docker image + docker-compose + Helm chart + `/healthz` + SIGTERM | (covered above) |
 | **v1.3.0** | Hosted | Caddy + Postgres + S3 + Terraform + status page | (ops doc) |
@@ -274,7 +275,7 @@ What does a human see?
 | Self-hostable Docker image | 🔵 Backlog (P3.1) | v1.3.0 |
 | Hosted deployment runbook | 🔵 Backlog (P3.2) | v1.3.0 |
 | Server-to-server federation | 🔵 Backlog (P3.3) | v1.4.0 |
-| GitHub sync agent | ✅ Shipped (one-shot + scrubber) — daemon + PR review in dev21+ | v1.2.0.dev20 |
+| GitHub sync agent | ✅ Shipped (one-shot + scrubber + daemon). PR review in dev22+. | v1.2.0.dev21 |
 
 ---
 

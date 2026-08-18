@@ -351,6 +351,71 @@ event stream, the MCP stdio server, and the auth rate limiter.
 
 ---
 
+## Watch daemon (v1.2.0.dev21)
+
+The watch daemon auto-pushes memory changes to GitHub as you make them —
+no more running `agentchat-sync push` after every edit. It wraps the
+existing `sync_agent.watcher` polling + debounce primitives with a
+daemon lifecycle (PID file, signals, detach).
+
+**Foreground mode** (default — run in your terminal or under systemd):
+
+```bash
+agentchat-sync watch
+# Ctrl-C to stop
+```
+
+**Detached mode** (run in the background; logs to `~/.hermes/sync/watch.log`):
+
+```bash
+agentchat-sync watch --detach
+# agentchat-sync watch (PID 12345, log /home/you/.hermes/sync/watch.log)
+
+agentchat-sync watch --status     # → running (pid=12345)
+agentchat-sync watch --stop       # → SIGTERM, wait up to 5s, force-kill
+```
+
+**Configuration** via `~/.hermes/sync/config.yaml`:
+
+```yaml
+workspace_slug: default
+mirror_root: ~/.hermes/sync/mirror/default
+watched_roots:
+  - ~/.hermes/memory
+debounce_seconds: 5.0          # coalesce bursts of writes
+poll_interval_seconds: 1.0      # FS poll cadence (min 0.5s effective)
+min_push_interval_seconds: 30.0 # throttle: never push more than once per N s
+exclude:
+  - "*.tmp"
+  - "*.bak"
+```
+
+CLI flags override YAML values, e.g. `agentchat-sync watch
+--debounce-seconds 2 --min-push-interval-seconds 60`.
+
+**Lifecycle.** The daemon:
+
+1. On start: validates the mirror exists, checks no other daemon is
+   running (via PID file + `kill -0`), writes its PID to
+   `~/.hermes/sync/watch.pid`.
+2. On every `debounce_seconds` of quiet: calls
+   `sync_github.push()` to materialise the mirror from
+   `~/.hermes/memory/`, scrub it, commit (with `--allow-empty`), and
+   push to `origin`.
+3. On SIGTERM / SIGINT: cancels the in-flight debounce, removes the
+   PID file, exits cleanly within 1 second.
+4. On push failure (network blip, GitHub down, etc.): logs the error
+   and keeps running. The next change will retry the push.
+
+**Prerequisites.** The mirror must already be initialised via
+`agentchat-sync init` and have a working `origin` remote (read with
+`git remote get-url origin`). The watch CLI will refuse to start
+without these and print a clear remediation message.
+
+**POSIX only.** `--detach` uses `os.fork()` and is therefore
+Linux/macOS only. On Windows, run under `start /b` or a scheduled
+task instead.
+
 ## GitHub sync (v1.2.0.dev20)
 
 One-shot mirror of memory + scrubbed config to a per-workspace GitHub repo.
@@ -445,12 +510,13 @@ agentchat-sync audit tail -n 20
 agentchat-sync audit show 2026-08-18
 ```
 
-**What is deferred to dev21+:**
+**What is deferred to dev22+:**
 
-- Daemon mode (`agentchat-sync watch`) — auto-push on file change. The
-  `sync_agent.watcher` module already supports it; the CLI wrapper is
-  the missing piece.
 - PR review flow (requires GitHub API token; `gh auth login` first).
+- Pull-on-startup (mirror local changes from GitHub back into the
+  local memory tree on daemon start).
+- Conflict resolution when the local mirror and the remote diverge
+  (e.g. edits made on a different machine).
 - Multi-host federation (v1.3) — when you run agentchat on multiple
   machines, each one mirrors its own workspace to the same repo with
   per-host commits.
