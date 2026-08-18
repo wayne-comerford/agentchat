@@ -1511,6 +1511,7 @@ def make_app(config: dict) -> web.Application:
     app.router.add_post("/v1/ui/agents", handle_create_agent)
     app.router.add_post("/v1/ui/agents/import-memory", handle_agent_import_memory)
     app.router.add_get("/v1/ui/memory/preview", handle_memory_preview)
+    app.router.add_post("/v1/ui/memory/preview", handle_memory_preview)
     app.router.add_get("/v1/ui/focus", handle_focus_get)
     app.router.add_post("/v1/ui/focus", handle_focus_post)
     app.router.add_get("/v1/ui/stream", handle_stream)

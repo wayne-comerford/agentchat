@@ -2,7 +2,8 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <meta name="theme-color" content="#0f172a">
     <title>AgentChat — Settings</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script defer src="https://unpkg.com/alpinejs@3.14.8/dist/cdn.min.js"></script>
@@ -30,24 +31,25 @@
         .badge-pending { background-color: #422006; color: #fbbf24; }
     </style>
 </head>
-<body class="min-h-screen flex flex-col">
+<body class="min-h-[100dvh] flex flex-col"
+      style="padding-top: env(safe-area-inset-top); padding-left: env(safe-area-inset-left); padding-right: env(safe-area-inset-right); padding-bottom: env(safe-area-inset-bottom);">
 
 <!-- Top nav -->
-<nav class="flex-none flex items-center justify-between px-6 py-3 border-b border-slate-800 bg-slate-900">
-    <div class="flex items-center gap-3">
-        <a href="/" class="text-slate-300 hover:text-white nav-link px-3 py-1.5 rounded-md">← Back to chat</a>
-        <span class="text-slate-600">|</span>
-        <h1 class="text-lg font-semibold">Settings</h1>
+<nav class="flex-none flex items-center justify-between gap-3 px-4 md:px-6 py-3 border-b border-slate-800 bg-slate-900">
+    <div class="flex items-center gap-2 md:gap-3 min-w-0">
+        <a href="/" class="text-slate-300 hover:text-white nav-link px-2 md:px-3 py-1.5 rounded-md text-sm md:text-base flex-none">← Back</a>
+        <span class="text-slate-600 flex-none">|</span>
+        <h1 class="text-base md:text-lg font-semibold truncate">Settings</h1>
     </div>
-    <div class="text-xs text-slate-500" x-data="{ now: new Date().toISOString() }" x-text="now"></div>
+    <div class="text-xs text-slate-500 flex-none" x-data="{ now: new Date().toISOString() }" x-text="now"></div>
 </nav>
 
 <!-- Main scroll area -->
-<main class="flex-1 min-h-0 overflow-y-auto px-6 py-8 max-w-4xl mx-auto w-full space-y-8"
+<main class="flex-1 min-h-0 overflow-y-auto px-4 md:px-6 py-6 md:py-8 max-w-4xl mx-auto w-full space-y-6 md:space-y-8"
       x-data="settingsPage()">
 
     <!-- Page intro -->
-    <div class="section-card p-6">
+    <div class="section-card p-4 md:p-6">
         <h2 class="text-xl font-semibold mb-2">Configure agentchat</h2>
         <p class="text-sm text-slate-400 mb-4">
             Settings persist to <code class="text-xs bg-slate-900 px-1.5 py-0.5 rounded">~/.hermes/</code>
@@ -64,51 +66,352 @@
     </div>
 
     <!-- Section 1: Agent Management -->
-    <section class="section-card p-6" id="agents">
+    <section class="section-card p-4 md:p-6" id="agents">
         <div class="flex items-center justify-between mb-4">
             <div>
                 <h2 class="text-lg font-semibold">I. Agent Management</h2>
-                <p class="text-xs text-slate-400">Nostr keys, roles, focus per agent</p>
+                <p class="text-xs text-slate-400">Live agents + Add Agent wizard with optional memory import</p>
             </div>
-            <span class="badge badge-pending">backend pending · t_56e6da84</span>
+            <span class="badge badge-ready">shipped · v1.2.0.dev19</span>
         </div>
-        <!-- Static read-only preview; live data wired in t_56e6da84 -->
+        <!-- Live agent list — populated from GET /v1/ui/agents -->
         <div class="space-y-2 text-sm" id="agent-list">
-            <div class="flex items-center justify-between bg-slate-900 px-4 py-3 rounded-lg">
-                <div>
-                    <div class="font-medium">hermes</div>
-                    <div class="text-xs text-slate-500">role: agent · last seen: just now</div>
+            <template x-if="loading.agents">
+                <div class="text-slate-500 text-sm py-3 text-center">Loading agents…</div>
+            </template>
+            <template x-if="!loading.agents && agents.length === 0">
+                <div class="text-slate-500 text-sm py-3 text-center">No agents yet. Click <strong>+ Add agent</strong> below.</div>
+            </template>
+            <template x-for="a in agents" :key="a.name">
+                <div class="flex items-center justify-between bg-slate-900 px-4 py-3 rounded-lg gap-3">
+                    <div class="min-w-0 flex-1">
+                        <div class="font-medium flex items-center gap-2">
+                            <span x-text="a.name"></span>
+                            <span x-show="a.role" class="text-[10px] px-1.5 py-0.5 rounded bg-slate-700 text-slate-300 font-mono"
+                                  x-text="a.role"></span>
+                        </div>
+                        <div class="text-xs text-slate-500 font-mono truncate" x-text="a.npub || '(no npub yet)'"></div>
+                    </div>
+                    <div class="flex items-center gap-3 flex-none">
+                        <span class="text-xs"
+                              :class="{
+                                'text-emerald-400': (a.status_entry?.status || 'disconnected') === 'active',
+                                'text-amber-400':   a.status_entry?.status === 'idle',
+                                'text-rose-400':    !a.status_entry || a.status_entry?.status === 'disconnected'
+                              }"
+                              x-text="a.status_entry?.status || 'disconnected'"></span>
+                        <button
+                            @click="openImportMemory(a.name)"
+                            class="text-xs text-slate-300 hover:text-white px-2 py-1 rounded border border-slate-700 hover:border-slate-500"
+                            title="Replace this agent's memory"
+                        >📥 Memory</button>
+                    </div>
                 </div>
-                <div class="flex items-center gap-2">
-                    <span class="status-dot status-active"></span>
-                    <span class="text-xs text-slate-400">active</span>
-                </div>
-            </div>
-            <div class="flex items-center justify-between bg-slate-900 px-4 py-3 rounded-lg">
-                <div>
-                    <div class="font-medium">chappy</div>
-                    <div class="text-xs text-slate-500">role: agent · last seen: 2m ago</div>
-                </div>
-                <div class="flex items-center gap-2">
-                    <span class="status-dot status-active"></span>
-                    <span class="text-xs text-slate-400">active</span>
-                </div>
-            </div>
-            <div class="flex items-center justify-between bg-slate-900 px-4 py-3 rounded-lg">
-                <div>
-                    <div class="font-medium">wayne-observer</div>
-                    <div class="text-xs text-slate-500">role: observer · last seen: 5m ago</div>
-                </div>
-                <div class="flex items-center gap-2">
-                    <span class="status-dot status-idle"></span>
-                    <span class="text-xs text-slate-400">idle</span>
-                </div>
-            </div>
+            </template>
         </div>
         <div class="mt-4 flex gap-2">
-            <button class="btn-primary text-sm" disabled>+ Add agent</button>
-            <button class="btn-secondary text-sm" disabled>Rotate keys</button>
+            <button
+                @click="openAddAgent()"
+                class="btn-primary text-sm"
+            >+ Add agent</button>
         </div>
+
+        <!-- ──────────────────────── Add Agent Modal ──────────────────────── -->
+        <div
+            x-show="modal === 'addAgent'"
+            x-transition:enter="transition-opacity ease-out duration-200"
+            x-transition:enter-start="opacity-0"
+            x-transition:enter-end="opacity-100"
+            x-transition:leave="transition-opacity ease-in duration-150"
+            x-transition:leave-start="opacity-100"
+            x-transition:leave-end="opacity-0"
+            @keydown.escape.window="closeModal()"
+            class="fixed inset-0 bg-black/70 z-50 flex items-end md:items-center justify-center p-0 md:p-4"
+            style="-webkit-tap-highlight-color: transparent;"
+        >
+            <div
+                @click.outside="closeModal()"
+                class="bg-slate-800 border border-slate-700 rounded-t-2xl md:rounded-xl w-full md:max-w-2xl max-h-[90vh] overflow-y-auto"
+                style="padding-bottom: env(safe-area-inset-bottom);"
+            >
+                <!-- Modal header -->
+                <header class="px-5 py-4 border-b border-slate-700 flex items-center sticky top-0 bg-slate-800 z-10">
+                    <div class="flex-1 min-w-0">
+                        <h3 class="text-lg font-semibold">Add agent</h3>
+                        <p class="text-xs text-slate-400 mt-0.5">Create a new agent. Optional: bring their existing memory.</p>
+                    </div>
+                    <button @click="closeModal()" class="text-slate-400 hover:text-white text-2xl leading-none px-2" title="Close (esc)">×</button>
+                </header>
+
+                <form @submit.prevent="submitAddAgent()" class="p-5 space-y-4">
+                    <!-- Required fields -->
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <label class="block">
+                            <span class="text-xs text-slate-400">Name <span class="text-rose-400">*</span></span>
+                            <input
+                                x-model="addAgent.name"
+                                @input="clearError()"
+                                type="text"
+                                placeholder="claude-code"
+                                required
+                                class="input-field mt-1"
+                                style="font-size: 16px;"
+                            >
+                            <span class="text-[10px] text-slate-500 mt-1 block">Letters, digits, hyphens, underscores. No leading dot/dash.</span>
+                        </label>
+                        <label class="block">
+                            <span class="text-xs text-slate-400">Role</span>
+                            <select x-model="addAgent.role" class="input-field mt-1">
+                                <option value="member">member</option>
+                                <option value="admin">admin</option>
+                                <option value="observer">observer</option>
+                            </select>
+                        </label>
+                    </div>
+
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <label class="block">
+                            <span class="text-xs text-slate-400">Nostr pubkey (npub)</span>
+                            <input
+                                x-model="addAgent.npub"
+                                type="text"
+                                placeholder="npub1..."
+                                class="input-field mt-1 font-mono text-xs"
+                            >
+                            <span class="text-[10px] text-slate-500 mt-1 block">Optional — agent can fill this in later by signing in.</span>
+                        </label>
+                        <label class="block">
+                            <span class="text-xs text-slate-400">Color</span>
+                            <input
+                                x-model="addAgent.color"
+                                type="color"
+                                class="input-field mt-1 h-10 p-1"
+                            >
+                        </label>
+                    </div>
+
+                    <label class="block">
+                        <span class="text-xs text-slate-400">Source ecosystem</span>
+                        <select x-model="addAgent.source_ecosystem" class="input-field mt-1">
+                            <option value="local">New — only in this workspace</option>
+                            <option value="onprem-wayne">From another workspace I'm a member of (v1.3)</option>
+                            <option value="cloud">From a federated peer workspace (v1.3)</option>
+                        </select>
+                        <span class="text-[10px] text-slate-500 mt-1 block">Stored as metadata. Cross-workspace federation lands in v1.3.</span>
+                    </label>
+
+                    <!-- Memory source (optional) -->
+                    <fieldset class="border border-slate-700 rounded-lg p-4 space-y-3">
+                        <legend class="text-xs text-slate-400 px-2">Memory source (optional)</legend>
+
+                        <div class="flex flex-col gap-2">
+                            <label class="flex items-center gap-2 text-sm">
+                                <input type="radio" value="none" x-model="addAgent.memoryMode" @change="clearPreview()">
+                                <span>No memory yet</span>
+                            </label>
+                            <label class="flex items-center gap-2 text-sm">
+                                <input type="radio" value="paste" x-model="addAgent.memoryMode" @change="clearPreview()">
+                                <span>Paste markdown</span>
+                            </label>
+                            <label class="flex items-center gap-2 text-sm">
+                                <input type="radio" value="upload" x-model="addAgent.memoryMode" @change="clearPreview()">
+                                <span>Upload .md file</span>
+                            </label>
+                        </div>
+
+                        <!-- Paste -->
+                        <div x-show="addAgent.memoryMode === 'paste'" class="space-y-2">
+                            <textarea
+                                x-model="addAgent.memoryMd"
+                                @input.debounce.300ms="fetchPreview()"
+                                rows="8"
+                                placeholder="# agent-name — Memory
+
+## Identity
+- ...
+"
+                                class="input-field font-mono text-xs"
+                                style="font-size: 14px;"
+                            ></textarea>
+                            <div class="text-[10px] text-slate-500 flex items-center justify-between">
+                                <span>64 KiB max inline</span>
+                                <span x-text="`${(new TextEncoder().encode(addAgent.memoryMd).length / 1024).toFixed(1)} KiB`"></span>
+                            </div>
+                        </div>
+
+                        <!-- Upload -->
+                        <div x-show="addAgent.memoryMode === 'upload'" class="space-y-2">
+                            <label class="block">
+                                <input
+                                    type="file"
+                                    accept=".md,.markdown,.txt"
+                                    @change="onFileSelected($event)"
+                                    class="block w-full text-xs text-slate-300 file:mr-3 file:py-1.5 file:px-3 file:rounded file:border-0 file:text-xs file:font-medium file:bg-slate-700 file:text-slate-200 hover:file:bg-slate-600"
+                                >
+                            </label>
+                            <div x-show="addAgent.uploadedFile" class="text-xs text-slate-400 flex items-center gap-2">
+                                <span>📄</span>
+                                <span x-text="addAgent.uploadedFile?.name"></span>
+                                <span class="text-slate-500" x-text="`(${(addAgent.uploadedFile?.size / 1024).toFixed(1)} KiB)`"></span>
+                                <button type="button" @click="addAgent.uploadedFile = null; addAgent.memoryMd = ''; clearPreview()" class="text-rose-400 hover:text-rose-300 ml-auto">remove</button>
+                            </div>
+                            <div class="text-[10px] text-slate-500">256 KiB max upload. File is read into the memory file on save.</div>
+                        </div>
+
+                        <!-- Live preview -->
+                        <div x-show="addAgent.memoryMode !== 'none' && preview"
+                             class="bg-slate-900 rounded-lg p-3 border border-slate-700 space-y-1.5">
+                            <div class="text-[10px] uppercase tracking-wider text-slate-500">Preview</div>
+                            <div class="text-xs flex flex-wrap items-center gap-3">
+                                <span class="text-slate-300">
+                                    <strong class="text-emerald-400" x-text="preview?.section_titles?.length || 0"></strong> sections
+                                </span>
+                                <span class="text-slate-300">
+                                    <strong class="text-emerald-400" x-text="preview?.total_line_count || 0"></strong> lines
+                                </span>
+                                <span x-show="preview?.intro_line_count > 0" class="text-slate-400">
+                                    (<span x-text="preview?.intro_line_count"></span> intro)
+                                </span>
+                            </div>
+                            <div x-show="preview?.section_titles?.length" class="text-[11px] text-slate-400">
+                                <span class="text-slate-500">Sections:</span>
+                                <template x-for="t in (preview?.section_titles || [])" :key="t">
+                                    <span class="inline-block bg-slate-800 text-slate-300 px-1.5 py-0.5 rounded mr-1 mt-1 font-mono" x-text="t"></span>
+                                </template>
+                            </div>
+                            <div x-show="preview?.warnings?.length" class="text-[11px] text-amber-300 space-y-0.5">
+                                <template x-for="(w, idx) in (preview?.warnings || [])" :key="idx">
+                                    <div>⚠ <span x-text="w"></span></div>
+                                </template>
+                            </div>
+                        </div>
+                    </fieldset>
+
+                    <!-- Error display -->
+                    <div x-show="addAgent.error" class="bg-rose-900/30 border border-rose-700 text-rose-200 text-sm rounded-lg p-3">
+                        <strong>Error:</strong> <span x-text="addAgent.error"></span>
+                    </div>
+
+                    <!-- Actions -->
+                    <div class="flex items-center justify-end gap-2 pt-2">
+                        <button type="button" @click="closeModal()" class="btn-secondary text-sm">Cancel</button>
+                        <button
+                            type="submit"
+                            :disabled="addAgent.busy || !addAgent.name.trim()"
+                            class="btn-primary text-sm"
+                        >
+                            <span x-show="!addAgent.busy">Save agent</span>
+                            <span x-show="addAgent.busy">Saving…</span>
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+
+        <!-- ──────────────────────── Import Memory Modal (existing-agent) ──────────────────────── -->
+        <div
+            x-show="modal === 'importMemory'"
+            x-transition:enter="transition-opacity ease-out duration-200"
+            x-transition:enter-start="opacity-0"
+            x-transition:enter-end="opacity-100"
+            x-transition:leave="transition-opacity ease-in duration-150"
+            x-transition:leave-start="opacity-100"
+            x-transition:leave-end="opacity-0"
+            @keydown.escape.window="closeModal()"
+            class="fixed inset-0 bg-black/70 z-50 flex items-end md:items-center justify-center p-0 md:p-4"
+            style="-webkit-tap-highlight-color: transparent;"
+        >
+            <div
+                @click.outside="closeModal()"
+                class="bg-slate-800 border border-slate-700 rounded-t-2xl md:rounded-xl w-full md:max-w-xl max-h-[90vh] overflow-y-auto"
+                style="padding-bottom: env(safe-area-inset-bottom);"
+            >
+                <header class="px-5 py-4 border-b border-slate-700 flex items-center sticky top-0 bg-slate-800 z-10">
+                    <div class="flex-1 min-w-0">
+                        <h3 class="text-lg font-semibold">Import memory</h3>
+                        <p class="text-xs text-slate-400 mt-0.5">Replace <strong x-text="importTarget"></strong>'s memory. Existing file is backed up to .bak.</p>
+                    </div>
+                    <button @click="closeModal()" class="text-slate-400 hover:text-white text-2xl leading-none px-2" title="Close (esc)">×</button>
+                </header>
+
+                <form @submit.prevent="submitImportMemory()" class="p-5 space-y-4">
+                    <div class="flex flex-col gap-2">
+                        <label class="flex items-center gap-2 text-sm">
+                            <input type="radio" value="paste" x-model="importMode.memoryMode" @change="clearPreview()">
+                            <span>Paste markdown</span>
+                        </label>
+                        <label class="flex items-center gap-2 text-sm">
+                            <input type="radio" value="upload" x-model="importMode.memoryMode" @change="clearPreview()">
+                            <span>Upload .md file</span>
+                        </label>
+                    </div>
+
+                    <div x-show="importMode.memoryMode === 'paste'" class="space-y-2">
+                        <textarea
+                            x-model="importMode.memoryMd"
+                            @input.debounce.300ms="fetchPreview()"
+                            rows="10"
+                            placeholder="## Identity&#10;- ...&#10;"
+                            class="input-field font-mono text-xs"
+                            style="font-size: 14px;"
+                        ></textarea>
+                    </div>
+
+                    <div x-show="importMode.memoryMode === 'upload'" class="space-y-2">
+                        <input
+                            type="file"
+                            accept=".md,.markdown,.txt"
+                            @change="onImportFileSelected($event)"
+                            class="block w-full text-xs text-slate-300 file:mr-3 file:py-1.5 file:px-3 file:rounded file:border-0 file:text-xs file:font-medium file:bg-slate-700 file:text-slate-200 hover:file:bg-slate-600"
+                        >
+                        <div x-show="importMode.uploadedFile" class="text-xs text-slate-400 flex items-center gap-2">
+                            <span>📄</span>
+                            <span x-text="importMode.uploadedFile?.name"></span>
+                            <span class="text-slate-500" x-text="`(${(importMode.uploadedFile?.size / 1024).toFixed(1)} KiB)`"></span>
+                        </div>
+                    </div>
+
+                    <div x-show="preview" class="bg-slate-900 rounded-lg p-3 border border-slate-700 space-y-1.5">
+                        <div class="text-[10px] uppercase tracking-wider text-slate-500">Preview</div>
+                        <div class="text-xs text-slate-300">
+                            <strong class="text-emerald-400" x-text="preview?.section_titles?.length || 0"></strong> sections ·
+                            <strong class="text-emerald-400" x-text="preview?.total_line_count || 0"></strong> lines
+                        </div>
+                        <div x-show="preview?.warnings?.length" class="text-[11px] text-amber-300 space-y-0.5">
+                            <template x-for="(w, idx) in (preview?.warnings || [])" :key="idx">
+                                <div>⚠ <span x-text="w"></span></div>
+                            </template>
+                        </div>
+                    </div>
+
+                    <div x-show="importMode.error" class="bg-rose-900/30 border border-rose-700 text-rose-200 text-sm rounded-lg p-3">
+                        <strong>Error:</strong> <span x-text="importMode.error"></span>
+                    </div>
+
+                    <div class="flex items-center justify-end gap-2 pt-2">
+                        <button type="button" @click="closeModal()" class="btn-secondary text-sm">Cancel</button>
+                        <button
+                            type="submit"
+                            :disabled="importMode.busy"
+                            class="btn-primary text-sm"
+                        >
+                            <span x-show="!importMode.busy">Import &amp; replace</span>
+                            <span x-show="importMode.busy">Importing…</span>
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+
+        <!-- Toast feedback -->
+        <div
+            x-show="toast"
+            x-transition
+            class="fixed bottom-4 left-1/2 -translate-x-1/2 bg-slate-900 border text-slate-100 px-4 py-2 rounded-lg shadow-lg text-sm z-50 max-w-sm"
+            :class="toast?.kind === 'error' ? 'border-rose-500' : 'border-emerald-500'"
+            x-text="toast?.text"
+            style="margin-bottom: env(safe-area-inset-bottom);"
+        ></div>
     </section>
 
     <!-- Section 2: Nostr Relays -->
@@ -339,6 +642,7 @@
 <script>
 function settingsPage() {
     return {
+        // Existing state (memory stats, import-from-snapshot UI)
         memoryRoot: '',
         memoryStats: { agents: 0, projects: 0 },
         busy: false,
@@ -352,12 +656,52 @@ function settingsPage() {
             noArchive: false,
         },
         importResult: null,
+
+        // ──────── NEW: live agent list (T2 — Add Agent wizard) ────────
+        agents: [],
+        loading: { agents: false },
+        modal: null,            // null | 'addAgent' | 'importMemory'
+        toast: null,            // { kind: 'ok'|'error', text: '' }
+        preview: null,          // last preview result from /v1/ui/memory/preview
+        importTarget: '',       // name of agent being memory-imported
+
+        // Add Agent form state
+        addAgent: {
+            name: '',
+            npub: '',
+            public_key_hex: '',
+            color: '#0ea5e9',
+            role: 'member',
+            source_ecosystem: 'local',
+            memoryMode: 'none',  // 'none' | 'paste' | 'upload'
+            memoryMd: '',
+            uploadedFile: null,
+            busy: false,
+            error: '',
+        },
+
+        // Import-Memory (existing-agent) form state
+        importMode: {
+            memoryMode: 'paste', // 'paste' | 'upload'
+            memoryMd: '',
+            uploadedFile: null,
+            busy: false,
+            error: '',
+        },
+
         async init() {
             await this.loadStats();
             await this.loadSources();
+            await this.loadAgents();
             // Refresh every 30s so the page reflects live agent focus changes.
-            setInterval(() => this.loadStats(), 30000);
+            setInterval(() => {
+                this.loadStats();
+                this.loadAgents();
+            }, 30000);
         },
+
+        // ──────────── existing helpers (memory stats, snapshot import) ────────────
+
         async loadStats() {
             try {
                 const r = await fetch('/health');
@@ -366,7 +710,6 @@ function settingsPage() {
             } catch (e) {
                 this.memoryRoot = '(unavailable)';
             }
-            // Real counts from the new memory store (live, not placeholder).
             try {
                 const r = await fetch('/v1/ui/memory/sources');
                 if (r.ok) {
@@ -374,7 +717,6 @@ function settingsPage() {
                     this.memoryStats.agents = (j.sources || []).reduce(
                         (acc, s) => Math.max(acc, s.agents), 0
                     );
-                    // projects count is still a placeholder (no endpoint yet)
                     this.memoryStats.projects = this.memoryStats.projects || '–';
                 }
             } catch (e) {
@@ -401,8 +743,6 @@ function settingsPage() {
             this.busy = true;
             this.lastSnapshot = '';
             try {
-                // Until /v1/ui/memory/snapshot lands (t_09ec227e), we offer
-                // a manual link so users can run the CLI snapshot themselves.
                 this.lastSnapshot = 'Use the CLI for now: python -m agentchat.memory snapshot';
             } finally {
                 this.busy = false;
@@ -429,13 +769,197 @@ function settingsPage() {
                     this.importResult = { error: j.error || `HTTP ${r.status}` };
                 } else {
                     this.importResult = j;
-                    // refresh stats after import
                     await this.loadStats();
                 }
             } catch (e) {
                 this.importResult = { error: String(e) };
             } finally {
                 this.busy = false;
+            }
+        },
+
+        // ──────────── NEW: live agent list + Add Agent wizard (T2) ────────────
+
+        async loadAgents() {
+            this.loading.agents = true;
+            try {
+                const r = await fetch('/v1/ui/agents', { credentials: 'include' });
+                if (r.ok) {
+                    this.agents = await r.json();
+                }
+            } catch (e) {
+                console.error('loadAgents failed', e);
+            } finally {
+                this.loading.agents = false;
+            }
+        },
+
+        openAddAgent() {
+            this.addAgent = {
+                name: '',
+                npub: '',
+                public_key_hex: '',
+                color: '#0ea5e9',
+                role: 'member',
+                source_ecosystem: 'local',
+                memoryMode: 'none',
+                memoryMd: '',
+                uploadedFile: null,
+                busy: false,
+                error: '',
+            };
+            this.preview = null;
+            this.modal = 'addAgent';
+        },
+
+        openImportMemory(name) {
+            this.importTarget = name;
+            this.importMode = {
+                memoryMode: 'paste',
+                memoryMd: '',
+                uploadedFile: null,
+                busy: false,
+                error: '',
+            };
+            this.preview = null;
+            this.modal = 'importMemory';
+        },
+
+        closeModal() {
+            this.modal = null;
+            this.preview = null;
+        },
+
+        clearError() {
+            this.addAgent.error = '';
+        },
+        clearPreview() {
+            this.preview = null;
+        },
+
+        async onFileSelected(ev) {
+            const file = ev.target.files?.[0];
+            if (!file) return;
+            this.addAgent.uploadedFile = file;
+            // Read into memoryMd so the preview endpoint can parse it
+            const text = await file.text();
+            this.addAgent.memoryMd = text;
+            await this.fetchPreview();
+        },
+
+        async onImportFileSelected(ev) {
+            const file = ev.target.files?.[0];
+            if (!file) return;
+            this.importMode.uploadedFile = file;
+            const text = await file.text();
+            this.importMode.memoryMd = text;
+            await this.fetchPreview();
+        },
+
+        async fetchPreview() {
+            const md = this.addAgent.memoryMode === 'paste' || this.addAgent.memoryMode === 'upload'
+                ? this.addAgent.memoryMd
+                : this.importMode.memoryMd;
+            if (!md || !md.trim()) {
+                this.preview = null;
+                return;
+            }
+            try {
+                const r = await fetch('/v1/ui/memory/preview', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    credentials: 'include',
+                    body: JSON.stringify({ memory_md: md }),
+                });
+                if (r.ok) {
+                    this.preview = await r.json();
+                } else {
+                    this.preview = null;
+                }
+            } catch (e) {
+                this.preview = null;
+            }
+        },
+
+        showToast(kind, text, ms=3500) {
+            this.toast = { kind, text };
+            setTimeout(() => { if (this.toast?.text === text) this.toast = null; }, ms);
+        },
+
+        async submitAddAgent() {
+            this.addAgent.error = '';
+            this.addAgent.busy = true;
+            try {
+                const body = {
+                    name: this.addAgent.name.trim(),
+                    role: this.addAgent.role,
+                    source_ecosystem: this.addAgent.source_ecosystem,
+                };
+                if (this.addAgent.npub) body.npub = this.addAgent.npub.trim();
+                if (this.addAgent.color) body.color = this.addAgent.color;
+                if (this.addAgent.memoryMode === 'paste' && this.addAgent.memoryMd.trim()) {
+                    body.memory_md = this.addAgent.memoryMd;
+                } else if (this.addAgent.memoryMode === 'upload' && this.addAgent.memoryMd) {
+                    body.memory_md = this.addAgent.memoryMd;
+                }
+                const r = await fetch('/v1/ui/agents', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    credentials: 'include',
+                    body: JSON.stringify(body),
+                });
+                const j = await r.json();
+                if (!r.ok) {
+                    this.addAgent.error = j.error || `HTTP ${r.status}`;
+                    return;
+                }
+                // Success
+                this.closeModal();
+                const memInfo = j.memory
+                    ? ` (${j.memory.sections_imported} sections, ${j.memory.lines_imported} lines)`
+                    : '';
+                this.showToast('ok', `Agent ${j.agent.name} created${memInfo}`);
+                await this.loadAgents();
+                await this.loadStats();
+            } catch (e) {
+                this.addAgent.error = String(e);
+            } finally {
+                this.addAgent.busy = false;
+            }
+        },
+
+        async submitImportMemory() {
+            this.importMode.error = '';
+            this.importMode.busy = true;
+            try {
+                if (!this.importMode.memoryMd.trim()) {
+                    this.importMode.error = 'No memory content to import';
+                    return;
+                }
+                const r = await fetch('/v1/ui/agents/import-memory', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    credentials: 'include',
+                    body: JSON.stringify({
+                        agent: this.importTarget,
+                        memory_md: this.importMode.memoryMd,
+                    }),
+                });
+                const j = await r.json();
+                if (!r.ok) {
+                    this.importMode.error = j.error || `HTTP ${r.status}`;
+                    return;
+                }
+                this.closeModal();
+                this.showToast(
+                    'ok',
+                    `Memory replaced for ${this.importTarget} (${j.sections_imported} sections, backup at ${j.backup_path ? j.backup_path.split('/').pop() : 'none'})`,
+                );
+                await this.loadStats();
+            } catch (e) {
+                this.importMode.error = String(e);
+            } finally {
+                this.importMode.busy = false;
             }
         },
     };
