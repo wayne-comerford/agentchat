@@ -324,6 +324,17 @@ async def handle_settings(request: web.Request) -> web.Response:
     )
 
 
+async def handle_reviews_page(request: web.Request) -> web.Response:
+    """Render the PR review UI page (v1.2.0.dev26)."""
+    html_path = Path(__file__).parent / "templates" / "reviews.html"
+    if not html_path.exists():
+        return web.Response(text="reviews.html not found", status=500)
+    return web.Response(
+        text=html_path.read_text(),
+        content_type="text/html",
+    )
+
+
 async def handle_memory_list_sources(request: web.Request) -> web.Response:
     """GET /v1/ui/memory/sources — list recent snapshot dirs available to import.
 
@@ -1504,6 +1515,7 @@ def make_app(config: dict) -> web.Application:
 
     app.router.add_get("/", handle_index)
     app.router.add_get("/settings", handle_settings)
+    app.router.add_get("/reviews", handle_reviews_page)
     app.router.add_get("/health", handle_health)
     app.router.add_get("/static/{path:.*}", handle_static)
     app.router.add_get("/v1/ui/channels", handle_channels)

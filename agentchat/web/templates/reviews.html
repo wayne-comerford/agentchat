@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>PR Reviews — agentchat</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%E2%9C%A2%3C/text%3E%3C/svg%3E" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="/static/app.css" />
+  <style>
+    body { background: #0f172a; color: #e2e8f0; font-family: 'Inter', system-ui, sans-serif; }
+    .card { background-color: #1e293b; border: 1px solid #334155; border-radius: 0.75rem; }
+    .status-pending { color: #fbbf24; }
+    .status-posted  { color: #34d399; }
+    .status-failed  { color: #f43f5e; }
+    .pr-row { transition: background-color 0.15s; }
+    .pr-row:hover { background-color: #334155; }
+    .pr-row.expanded { background-color: #1e3a5f; }
+    .comment-block { border-left: 2px solid #475569; padding-left: 0.75rem; }
+    .inline-comment { background-color: #0c1c33; }
+    .general-comment { background-color: #1c2c44; }
+    pre { white-space: pre-wrap; word-wrap: break-word; }
+    .diff-add { color: #6ee7b7; }
+    .diff-del { color: #fca5a5; }
+    [x-cloak] { display: none !important; }
+  </style>
+</head>
+<body class="min-h-screen" x-data="reviewsApp()" x-init="init()" x-cloak>
+
+<header class="border-b border-slate-700 bg-slate-900 sticky top-0 z-10">
+  <div class="max-w-6xl mx-auto px-4 py-3 flex items-center gap-3">
+    <a href="/" class="text-slate-400 hover:text-slate-200 text-sm">← Chat</a>
+    <h1 class="text-lg font-semibold text-slate-100">PR Reviews</h1>
+    <span class="text-xs text-slate-500 font-mono" x-text="repo"></span>
+    <div class="ml-auto flex items-center gap-2">
+      <input
+        type="text" x-model="repo"
+        @keydown.enter="loadAll()"
+        placeholder="owner/repo"
+        class="text-xs px-2 py-1 rounded border border-slate-700 bg-slate-800 text-slate-200 font-mono w-40"
+      />
+      <button @click="loadAll()" :disabled="loading"
+        class="text-xs px-3 py-1 rounded bg-sky-600 hover:bg-sky-500 text-white disabled:opacity-50">
+        <span x-show="!loading">Refresh</span>
+        <span x-show="loading">…</span>
+      </button>
+    </div>
+  </div>
+</header>
+
+<main class="max-w-6xl mx-auto px-4 py-6 space-y-6">
+
+  <!-- Error banner -->
+  <div x-show="error" class="card p-4 border-rose-500/40 bg-rose-500/10">
+    <div class="text-rose-300 text-sm font-mono" x-text="error"></div>
+  </div>
+
+  <!-- Open PRs -->
+  <section class="card p-4 md:p-6">
+    <h2 class="text-sm font-semibold text-slate-300 uppercase tracking-wider mb-3 flex items-center gap-2">
+      <span>Open PRs</span>
+      <span class="text-xs text-slate-500 font-normal" x-text="`(${prs.length})`"></span>
+    </h2>
+    <div x-show="!loading && prs.length === 0" class="text-sm text-slate-500 italic py-4 text-center">
+      No open PRs on <span x-text="repo" class="font-mono"></span>
+    </div>
+    <ul class="divide-y divide-slate-700">
+      <template x-for="p in prs" :key="p.number">
+        <li>
+          <button
+            @click="togglePr(p)"
+            class="pr-row w-full text-left px-3 py-3 flex items-start gap-3"
+            :class="{ 'expanded': expandedPr === p.number }"
+          >
+            <span class="text-xs text-slate-500 font-mono mt-0.5" x-text="'#' + p.number"></span>
+            <div class="flex-1 min-w-0">
+              <div class="text-sm text-slate-200 font-medium" x-text="p.title"></div>
+              <div class="text-xs text-slate-500 mt-0.5 flex items-center gap-2 flex-wrap">
+                <span x-text="(p.author?.login || '?')"></span>
+                <span>·</span>
+                <span class="font-mono" x-text="p.headRefName"></span>
+                <span>→</span>
+                <span class="font-mono" x-text="p.baseRefName"></span>
+                <span x-show="p.isDraft" class="text-amber-400">(draft)</span>
+              </div>
+            </div>
+            <span class="text-slate-500 text-xs" x-text="expandedPr === p.number ? '▼' : '▶'"></span>
+          </button>
+
+          <!-- PR detail (expanded) -->
+          <div x-show="expandedPr === p.number" class="px-3 pb-4 pt-2 space-y-3">
+            <template x-if="expandedPr === p.number">
+              <div>
+                <div class="text-xs text-slate-500 mb-2" x-show="loadingDetail">
+                  Loading PR details…
+                </div>
+                <template x-if="!loadingDetail && detail">
+                  <div class="space-y-4">
+                    <div class="grid grid-cols-2 md:grid-cols-4 gap-2 text-xs">
+                      <div class="bg-slate-800 px-3 py-2 rounded">
+                        <div class="text-slate-500">+</div>
+                        <div class="text-emerald-400 font-mono text-base" x-text="detail.pr?.additions || 0"></div>
+                      </div>
+                      <div class="bg-slate-800 px-3 py-2 rounded">
+                        <div class="text-slate-500">−</div>
+                        <div class="text-rose-400 font-mono text-base" x-text="detail.pr?.deletions || 0"></div>
+                      </div>
+                      <div class="bg-slate-800 px-3 py-2 rounded">
+                        <div class="text-slate-500">files</div>
+                        <div class="text-slate-200 font-mono text-base" x-text="detail.pr?.changedFiles || 0"></div>
+                      </div>
+                      <div class="bg-slate-800 px-3 py-2 rounded">
+                        <div class="text-slate-500">state</div>
+                        <div class="text-slate-200 font-mono text-base" x-text="detail.pr?.state || '?'"></div>
+                      </div>
+                    </div>
+
+                    <div x-show="detail.pr?.body" class="text-sm text-slate-300 bg-slate-800 px-3 py-2 rounded">
+                      <pre x-text="detail.pr?.body"></pre>
+                    </div>
+
+                    <div class="text-sm text-slate-400">
+                      <a :href="detail.pr?.url" target="_blank"
+                         class="text-sky-400 hover:text-sky-300 underline font-mono text-xs"
+                         x-text="detail.pr?.url"></a>
+                    </div>
+
+                    <!-- Comments -->
+                    <div>
+                      <h3 class="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">
+                        Comments (<span x-text="(detail.comments || []).length"></span>)
+                      </h3>
+                      <div x-show="(detail.comments || []).length === 0" class="text-xs text-slate-500 italic">
+                        No comments yet.
+                      </div>
+                      <ul class="space-y-2">
+                        <template x-for="(c, i) in (detail.comments || [])" :key="i">
+                          <li class="comment-block py-2"
+                            :class="c.type === 'review' ? 'inline-comment' : 'general-comment'">
+                            <div class="flex items-center gap-2 text-xs text-slate-400 mb-1">
+                              <span class="font-mono" x-text="'@' + (c.author || '?')"></span>
+                              <span x-show="c.type === 'review'" class="text-sky-400">inline</span>
+                              <span x-show="c.type === 'issue'" class="text-indigo-400">general</span>
+                              <span x-show="c.path" class="text-slate-500 font-mono" x-text="c.path + (c.line ? ':' + c.line : '')"></span>
+                              <button @click="replyTo(c)" class="ml-auto text-sky-400 hover:text-sky-300">reply</button>
+                            </div>
+                            <pre class="text-sm text-slate-200 whitespace-pre-wrap" x-text="c.body"></pre>
+                          </li>
+                        </template>
+                      </ul>
+                    </div>
+
+                    <!-- Local draft comments -->
+                    <div x-show="(detail.local || []).length > 0">
+                      <h3 class="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">
+                        Local drafts
+                      </h3>
+                      <ul class="space-y-1">
+                        <template x-for="lc in (detail.local || [])" :key="lc.id">
+                          <li class="text-xs flex items-center gap-2 bg-slate-800/50 px-2 py-1 rounded">
+                            <span class="font-mono text-slate-500" x-text="'#' + lc.id"></span>
+                            <span :class="'status-' + lc.status" x-text="lc.status"></span>
+                            <span class="text-slate-400" x-text="'@' + (lc.agent || '?')"></span>
+                            <span class="text-slate-300 flex-1 truncate" x-text="lc.body"></span>
+                            <span x-show="lc.error" class="text-rose-400 font-mono text-[10px]"
+                                  :title="lc.error" x-text="lc.error?.slice(0, 60)"></span>
+                          </li>
+                        </template>
+                      </ul>
+                    </div>
+
+                    <!-- New comment box -->
+                    <div class="bg-slate-800 px-3 py-3 rounded space-y-2">
+                      <h3 class="text-xs font-semibold text-slate-400 uppercase tracking-wider">
+                        New comment
+                      </h3>
+                      <div class="grid grid-cols-1 md:grid-cols-2 gap-2 text-xs">
+                        <input
+                          type="text" x-model="newComment.path"
+                          placeholder="file path (for inline, e.g. src/main.py)"
+                          class="px-2 py-1.5 rounded border border-slate-700 bg-slate-900 text-slate-200 font-mono"
+                        />
+                        <input
+                          type="number" x-model="newComment.line"
+                          placeholder="line (for inline)"
+                          class="px-2 py-1.5 rounded border border-slate-700 bg-slate-900 text-slate-200 font-mono"
+                        />
+                      </div>
+                      <textarea
+                        x-model="newComment.body" rows="3"
+                        placeholder="Your comment…"
+                        class="w-full px-2 py-1.5 rounded border border-slate-700 bg-slate-900 text-slate-200 text-sm"
+                      ></textarea>
+                      <div class="flex items-center gap-2">
+                        <label class="text-xs text-slate-400 flex items-center gap-1">
+                          <input type="checkbox" x-model="newComment.no_post" />
+                          save as draft only
+                        </label>
+                        <span x-show="newComment.in_reply_to" class="text-xs text-slate-500">
+                          Replying to comment <span class="font-mono" x-text="newComment.in_reply_to"></span>
+                          <button @click="newComment.in_reply_to = null" class="text-rose-400 ml-1">×</button>
+                        </span>
+                        <button @click="submitComment(p.number)" :disabled="submitting || !newComment.body.trim()"
+                          class="ml-auto text-xs px-3 py-1.5 rounded bg-emerald-600 hover:bg-emerald-500 text-white disabled:opacity-50">
+                          <span x-show="!submitting">Post comment</span>
+                          <span x-show="submitting">…</span>
+                        </button>
+                      </div>
+                    </div>
+
+                    <div x-show="lastSubmit" class="text-xs px-2 py-1 rounded"
+                      :class="lastSubmit?.status === 'posted' ? 'bg-emerald-500/10 text-emerald-300' :
+                               lastSubmit?.status === 'pending' ? 'bg-amber-500/10 text-amber-300' :
+                               'bg-rose-500/10 text-rose-300'">
+                      <span class="font-mono" x-text="lastSubmit?.status"></span>
+                      <span x-show="lastSubmit?.error" x-text="' · ' + lastSubmit?.error"></span>
+                    </div>
+                  </div>
+                </template>
+              </div>
+            </template>
+          </div>
+        </li>
+      </template>
+    </ul>
+  </section>
+
+  <!-- Webhook events -->
+  <section class="card p-4 md:p-6">
+    <h2 class="text-sm font-semibold text-slate-300 uppercase tracking-wider mb-3 flex items-center gap-2">
+      <span>Recent webhook events</span>
+      <span class="text-xs text-slate-500 font-normal" x-text="`(${webhookEvents.length})`"></span>
+    </h2>
+    <div x-show="webhookEvents.length === 0" class="text-sm text-slate-500 italic py-2">
+      No webhook events received yet.
+    </div>
+    <ul class="divide-y divide-slate-700">
+      <template x-for="e in webhookEvents" :key="e.id">
+        <li class="py-2 flex items-center gap-3 text-xs">
+          <span class="font-mono text-slate-500" x-text="'#' + e.id"></span>
+          <span class="text-slate-300 font-mono" x-text="formatTime(e.received_at)"></span>
+          <span class="text-sky-400" x-text="e.event_type"></span>
+          <span class="text-slate-400" x-text="(e.action || '-')"></span>
+          <span class="text-slate-500 font-mono" x-text="(e.repo || '?') + (e.pr_number ? '#' + e.pr_number : '')"></span>
+        </li>
+      </template>
+    </ul>
+  </section>
+
+</main>
+
+<script>
+function reviewsApp() {
+  return {
+    repo: (window.__REPO__ || 'wayne-comerford/agentchat'),
+    prs: [],
+    webhookEvents: [],
+    error: null,
+    loading: false,
+    loadingDetail: false,
+    expandedPr: null,
+    detail: null,
+    submitting: false,
+    lastSubmit: null,
+    newComment: { body: '', path: '', line: '', in_reply_to: null, no_post: false },
+
+    async init() {
+      await this.loadAll();
+    },
+
+    async loadAll() {
+      this.loading = true;
+      this.error = null;
+      try {
+        const url = `/v1/ui/reviews?repo=${encodeURIComponent(this.repo)}`;
+        const r = await fetch(url);
+        const data = await r.json();
+        if (data.error && !data.prs.length) {
+          this.error = data.error;
+        }
+        this.prs = data.prs || [];
+        this.webhookEvents = data.webhook_events || [];
+      } catch (e) {
+        this.error = `load failed: ${e.message}`;
+      } finally {
+        this.loading = false;
+      }
+    },
+
+    async togglePr(p) {
+      if (this.expandedPr === p.number) {
+        this.expandedPr = null;
+        this.detail = null;
+        return;
+      }
+      this.expandedPr = p.number;
+      this.detail = null;
+      this.newComment = { body: '', path: '', line: '', in_reply_to: null, no_post: false };
+      this.lastSubmit = null;
+      await this.loadDetail(p.number);
+    },
+
+    async loadDetail(number) {
+      this.loadingDetail = true;
+      try {
+        const r = await fetch(`/v1/ui/reviews/${number}?repo=${encodeURIComponent(this.repo)}`);
+        this.detail = await r.json();
+        if (this.detail.error) {
+          this.error = this.detail.error;
+        }
+      } catch (e) {
+        this.error = `detail load failed: ${e.message}`;
+      } finally {
+        this.loadingDetail = false;
+      }
+    },
+
+    replyTo(c) {
+      this.newComment.in_reply_to = c.id;
+      this.newComment.body = `> @${c.author}: ${c.body.split('\n')[0].slice(0, 60)}...\n\n`;
+    },
+
+    async submitComment(number) {
+      this.submitting = true;
+      this.lastSubmit = null;
+      try {
+        const payload = {
+          body: this.newComment.body,
+          path: this.newComment.path || null,
+          line: this.newComment.line ? parseInt(this.newComment.line) : null,
+          in_reply_to: this.newComment.in_reply_to || null,
+          no_post: this.newComment.no_post,
+        };
+        const r = await fetch(`/v1/ui/reviews/${number}/comments`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        this.lastSubmit = await r.json();
+        if (this.lastSubmit.status === 'posted' || this.lastSubmit.status === 'pending') {
+          this.newComment = { body: '', path: '', line: '', in_reply_to: null, no_post: false };
+          await this.loadDetail(number);
+        }
+      } catch (e) {
+        this.lastSubmit = { status: 'failed', error: e.message };
+      } finally {
+        this.submitting = false;
+      }
+    },
+
+    formatTime(ts) {
+      if (!ts) return '-';
+      const d = new Date(ts * 1000);
+      return d.toISOString().slice(0, 19).replace('T', ' ');
+    },
+  };
+}
+</script>
+
+</body>
+</html>
