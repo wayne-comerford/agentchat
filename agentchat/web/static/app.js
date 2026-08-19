@@ -26,6 +26,10 @@ function workspace() {
     sidebarOpen: false,          // mobile sidebar drawer; auto-closes on select
     isMobile: false,             // window.matchMedia('(max-width: 767px)')
 
+    // ─────────── reply-to-message state ───────────
+    replyContext: null,          // { id, pubkey, content, created_at, parent_snippet }
+    parentModal: null,           // { id, pubkey, content, created_at } when parent is offscreen
+
     // ─────────── Memories drawer ───────────
     memoriesOpen: false,
     memories: {
@@ -331,13 +335,29 @@ function workspace() {
       }
       this.posting = true;
 
-      // Extract @mentions from draft
+      // Extract @mentions from draft (the parent's pubkey will be added
+      // server-side if replyContext is set — so we deliberately do NOT
+      // add it client-side to avoid duplicates).
       const mentions = [];
       this.draft.replace(/@([a-zA-Z0-9_-]+)/g, (m, name) => {
         const a = this.agents.find(x => x.name === name);
         if (a) mentions.push(a.public_key_hex);
         return m;
       });
+
+      // Build reply_to payload from the active reply context.  We
+      // pre-truncate the snippet client-side too as a UX nicety so the
+      // user sees the same length that will end up on the relay.
+      let reply_to = null;
+      if (this.replyContext) {
+        let snippet = (this.replyContext.content || '').replace(/\n/g, ' ').trim();
+        if (snippet.length > 140) snippet = snippet.slice(0, 137) + '…';
+        reply_to = {
+          id: this.replyContext.id,
+          author: this.replyContext.pubkey,
+          snippet,
+        };
+      }
 
       try {
         const res = await fetch('/v1/ui/post', {
@@ -348,6 +368,7 @@ function workspace() {
             channel: this.activeChannel.id,
             content: this.draft,
             mentions,
+            reply_to,
           }),
         });
         const data = await res.json();
@@ -356,6 +377,7 @@ function workspace() {
         } else {
           this.draft = '';
           this.mentionOpen = false;
+          this.replyContext = null;   // clear reply target after successful post
           // The SSE stream will push our own message back; no manual insert
         }
       } catch (e) {
@@ -367,6 +389,90 @@ function workspace() {
           if (ta) ta.focus();
         });
       }
+    },
+
+    // ─────────── reply-to-message ───────────
+    setReplyTarget(msg) {
+      if (!msg || !msg.event_id) return;
+      this.replyContext = {
+        id: msg.event_id,
+        pubkey: msg.pubkey,
+        content: msg.content || '',
+        created_at: msg.created_at,
+      };
+      // Focus the composer + clear any mention dropdown state.
+      this.mentionOpen = false;
+      this.$nextTick(() => {
+        const ta = document.querySelector('textarea');
+        if (ta) ta.focus();
+      });
+    },
+
+    clearReplyTarget() {
+      this.replyContext = null;
+    },
+
+    replyContextSnippet() {
+      if (!this.replyContext) return '';
+      let s = (this.replyContext.content || '').replace(/\n/g, ' ').trim();
+      if (s.length > 80) s = s.slice(0, 77) + '…';
+      return s;
+    },
+
+    // Look up a message's parent in the loaded channel.  Returns the
+    // message object or null if the parent is not in the visible window.
+    parentOf(msg) {
+      if (!msg || !msg.reply_to) return null;
+      return this.messages.find(m => m.event_id === msg.reply_to) || null;
+    },
+
+    // Click a "Replying to: …" rail.  If the parent is in the loaded
+    // channel window, scroll to it.  Otherwise fetch it from the relay
+    // and pop the parent modal.
+    async jumpToParent(msg) {
+      if (!msg || !msg.reply_to) return;
+      const local = this.parentOf(msg);
+      if (local) {
+        const el = document.getElementById(`msg-${local.event_id}`);
+        if (el) {
+          el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          // Brief highlight so the user can see which message it is.
+          el.classList.add('ring-2', 'ring-sky-500/60');
+          setTimeout(() => el.classList.remove('ring-2', 'ring-sky-500/60'), 1500);
+          return;
+        }
+      }
+      // Parent not loaded → fetch from relay and pop modal.
+      try {
+        const res = await fetch(`/v1/ui/messages/${msg.reply_to}`, {
+          credentials: 'same-origin',
+        });
+        const data = await res.json();
+        if (data.ok && data.message) {
+          this.parentModal = {
+            id: data.message.id,
+            pubkey: data.message.pubkey,
+            content: data.message.content,
+            created_at: data.message.created_at,
+          };
+        } else {
+          alert('Parent message not found (may have been pruned by the relay).');
+        }
+      } catch (e) {
+        alert('Failed to fetch parent: ' + e.message);
+      }
+    },
+
+    // "Reply to this" button inside the parent modal — sets the
+    // reply context from the modal's payload and focuses the composer.
+    replyToParentFromModal() {
+      if (!this.parentModal) return;
+      this.setReplyTarget({
+        event_id: this.parentModal.id,
+        pubkey: this.parentModal.pubkey,
+        content: this.parentModal.content,
+        created_at: this.parentModal.created_at,
+      });
     },
 
     // ─────────── @mention autocomplete ───────────

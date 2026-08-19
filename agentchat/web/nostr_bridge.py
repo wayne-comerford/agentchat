@@ -19,6 +19,8 @@ Endpoints:
     GET  /v1/ui/stream?channel=<id>   — SSE: kind:9 events for that channel
                                        (special: channel=agent_status → liveness stream)
     POST /v1/ui/post                  — sign + publish kind:9
+                                       (supports threaded reply via reply_to)
+    GET  /v1/ui/messages/{id}         — fetch one kind:9 event by id (parent lookup)
     GET  /health                      — liveness
 
 Config:
@@ -1090,11 +1092,30 @@ async def handle_post(request: web.Request) -> web.Response:
     """
     Sign and publish a kind:9 message as the LOGGED-IN identity.
 
-    Body: { "channel": "<id>", "content": "<text>", "mentions": ["<pubkey-hex>", ...] }
+    Body: {
+        "channel":    "<id>",
+        "content":    "<text>",
+        "mentions":   ["<pubkey-hex>", ...]   // optional, explicit @mentions
+        "reply_to":   {                        // optional, threaded reply
+            "id":      "<event-id-hex>",       //   the parent message id
+            "author":  "<pubkey-hex>",         //   the parent's author (so the
+                                               //   server can add an implicit
+                                               //   #p mention without trusting
+                                               //   client-supplied mentions)
+            "snippet": "<text>",               //   ≤140 chars, plain text
+        },
+    }
 
     The session cookie determines which keypair signs the event.  If no
     session is present the bridge falls back to its default identity (kept
     for backwards compat with the smoke tests).
+
+    Reply semantics: when reply_to is set, the event is published with an
+    ["e", parent_id, "", "reply"] NIP-29 tag, the parent's author is
+    auto-added to #p (so an LLM agent will know to respond), and a
+    ["parent_snippet", text] tag carries the quoted block. Client-supplied
+    mentions for the same parent are deduped — the parent author appears
+    exactly once in the #p list.
     """
     state = get_state(request.app)
     if state.pool is None:
@@ -1107,12 +1128,46 @@ async def handle_post(request: web.Request) -> web.Response:
 
     channel = body.get("channel", "").strip()
     content = body.get("content", "").strip()
-    mentions = body.get("mentions") or []
+    mentions = list(body.get("mentions") or [])
+    reply_to_raw = body.get("reply_to") or None
 
     if not channel or not content:
         return web.json_response(
             {"error": "channel and content required"}, status=400
         )
+
+    # Validate + normalise reply_to. We never trust the client for the
+    # author pubkey of the parent — it's not used for any security boundary
+    # but is deduped against explicit mentions to keep the #p list clean.
+    reply_to_id: str | None = None
+    parent_author: str | None = None
+    parent_snippet: str | None = None
+    if reply_to_raw is not None:
+        if not isinstance(reply_to_raw, dict):
+            return web.json_response(
+                {"error": "reply_to must be an object"}, status=400
+            )
+        rid = (reply_to_raw.get("id") or "").strip()
+        if not rid or len(rid) != 64 or not all(c in "0123456789abcdef" for c in rid):
+            return web.json_response(
+                {"error": "reply_to.id must be a 64-char hex event id"},
+                status=400,
+            )
+        reply_to_id = rid
+        author = (reply_to_raw.get("author") or "").strip()
+        if author:
+            # Normalise lowercase hex; silently drop if malformed.
+            if len(author) == 64 and all(c in "0123456789abcdef" for c in author.lower()):
+                parent_author = author.lower()
+        snippet = reply_to_raw.get("snippet")
+        if snippet is not None:
+            snippet = str(snippet).replace("\n", " ").strip()
+            if len(snippet) > 140:
+                snippet = snippet[:137] + "..."
+        parent_snippet = snippet
+        # Implicit mention of the parent author — dedup against explicit list.
+        if parent_author and parent_author not in mentions:
+            mentions.append(parent_author)
 
     # Resolve signer from session.  No session → 401, never fall back to
     # bridge default identity (was a security hole: anyone on LAN could
@@ -1145,6 +1200,8 @@ async def handle_post(request: web.Request) -> web.Response:
             channel_id=channel,
             content=content,
             mentions=mentions,
+            reply_to=reply_to_id,
+            parent_snippet=parent_snippet,
         )
         # Record activity for the logged-in session (sidebar live status).
         record_activity(session_name, channel=channel, last_message=content)
@@ -1157,10 +1214,159 @@ async def handle_post(request: web.Request) -> web.Response:
             "event_id": event_id,
             "channel": channel,
             "signed_by": signer.npub,
+            "reply_to": reply_to_id,
+            "parent_snippet": parent_snippet,
         })
     except Exception as e:
         log.warning("publish failed: %s", e)
         return web.json_response({"error": str(e)}, status=500)
+
+
+# --------------------------------------------------------------------------- #
+# Single message lookup — used by the "click parent" rail in the chat UI when
+# the parent message has scrolled off the visible window.  Fetches the kind:9
+# event from the relay by event id, and returns it in the same shape the SSE
+# stream emits so the client can render a quoted block consistently.
+# --------------------------------------------------------------------------- #
+
+async def handle_get_message(request: web.Request) -> web.Response:
+    """
+    GET /v1/ui/messages/{event_id}
+
+    Returns one kind:9 message in the standard envelope:
+
+        {
+            "ok": true,
+            "message": {
+                "id":           "<event-id-hex>",
+                "pubkey":       "<author-pubkey-hex>",
+                "content":      "<text>",
+                "created_at":   <unix-ts>,
+                "channel":      "<h-tag-value>",
+                "mentions":     ["<pubkey-hex>", ...],
+                "reply_to":     "<event-id-hex-or-null>",
+                "parent_snippet": "<text-or-null>",
+            }
+        }
+
+    Returns 404 if the relay doesn't have the event (could be older than
+    its retention window, or authored on a relay we don't peer with).
+    Returns 400 if the event_id is malformed.
+    """
+    state = get_state(request.app)
+    if state.pool is None:
+        return web.json_response({"error": "bridge not started"}, status=503)
+
+    eid = request.match_info.get("event_id", "").strip()
+    if (
+        not eid
+        or len(eid) != 64
+        or not all(c in "0123456789abcdef" for c in eid.lower())
+    ):
+        return web.json_response(
+            {"error": "event_id must be 64-char hex"}, status=400
+        )
+    eid = eid.lower()
+
+    # Query the relay for this event id.  The relay is a separate process —
+    # pull its base URL by deriving from the WS endpoint (canonical) or
+    # honouring an explicit override if one is set.
+    relay_http = state.config.get("relay_http_url")
+    if not relay_http:
+        relays = state.config.get("relays") or []
+        if relays:
+            relay_http = _relay_http_from_ws(relays[0])
+    if not relay_http:
+        return web.json_response(
+            {"error": "relay http url not configured"}, status=503
+        )
+
+    # Some relay implementations expose /events as POST-with-filter; others as
+    # GET.  Try POST first (NIP-29 echo_relay does this), then fall back to
+    # GET with ?ids= for clients that prefer it.
+    try:
+        async with aiohttp.ClientSession() as session:
+            payload = {"ids": [eid], "kinds": [9]}
+            async with session.post(
+                f"{relay_http}/events",
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=5),
+            ) as r:
+                r.raise_for_status()
+                events = await r.json(content_type=None)
+    except aiohttp.ClientResponseError as e:
+        if e.status == 404:
+            return web.json_response({"error": "message not found"}, status=404)
+        log.warning("relay POST /events failed: %s", e)
+        return web.json_response(
+            {"error": f"relay lookup failed: {e}"}, status=502
+        )
+    except Exception as e:
+        # Fallback to GET ?ids=…  (covers relays that don't accept POST)
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"{relay_http}/events",
+                    params={"ids": eid, "kinds": "9"},
+                    timeout=aiohttp.ClientTimeout(total=5),
+                ) as r:
+                    r.raise_for_status()
+                    events = await r.json(content_type=None)
+        except Exception as e2:
+            log.warning("relay GET /events failed: %s", e2)
+            return web.json_response(
+                {"error": f"relay lookup failed: {e2}"}, status=502
+            )
+
+    if not events:
+        return web.json_response({"error": "message not found"}, status=404)
+
+    # The relay may return more than one if our filter was loose; pick the
+    # first kind:9 with a matching id.
+    ev = None
+    for cand in events:
+        if cand.get("id", "").lower() == eid and cand.get("kind") == 9:
+            ev = cand
+            break
+    if ev is None:
+        return web.json_response({"error": "message not found"}, status=404)
+
+    # Extract reply_to + parent_snippet from tags (canonical NIP-29 #e +
+    # our non-standard #parent_snippet).
+    tags = ev.get("tags") or []
+    reply_to = None
+    parent_snippet = None
+    channel = None
+    mentions: list[str] = []
+    for tag in tags:
+        if not tag:
+            continue
+        t = tag[0]
+        if t == "h" and len(tag) > 1:
+            channel = tag[1]
+        elif t == "p" and len(tag) > 1:
+            mentions.append(tag[1])
+        elif t == "e" and len(tag) > 1:
+            # Only the first #e with a "reply" marker is the parent.  Some
+            # relays also add a "root" marker; first reply wins.
+            if reply_to is None and (len(tag) < 3 or tag[3] == "reply"):
+                reply_to = tag[1]
+        elif t == "parent_snippet" and len(tag) > 1:
+            parent_snippet = tag[1]
+
+    return web.json_response({
+        "ok": True,
+        "message": {
+            "id":             ev.get("id"),
+            "pubkey":         ev.get("pubkey"),
+            "content":        ev.get("content", ""),
+            "created_at":     int(ev.get("created_at", 0)),
+            "channel":        channel,
+            "mentions":       mentions,
+            "reply_to":       reply_to,
+            "parent_snippet": parent_snippet,
+        },
+    })
 
 
 # --------------------------------------------------------------------------- #
@@ -1442,6 +1648,20 @@ async def handle_stream(request: web.Request) -> web.StreamResponse:
                         seen_ids.add(eid)
                         continue
                     seen_ids.add(eid)
+                    # Extract reply_to (#e reply) and parent_snippet
+                    # (#parent_snippet, our non-standard tag) from the
+                    # event tags so the UI doesn't have to re-parse.
+                    _ev_tags = ev.get("tags", []) or []
+                    _reply_to: str | None = None
+                    _parent_snippet: str | None = None
+                    for _t in _ev_tags:
+                        if not _t:
+                            continue
+                        if _t[0] == "e" and len(_t) > 1:
+                            if _reply_to is None and (len(_t) < 3 or _t[3] == "reply"):
+                                _reply_to = _t[1]
+                        elif _t[0] == "parent_snippet" and len(_t) > 1:
+                            _parent_snippet = _t[1]
                     payload = {
                         "event_id": eid,
                         "kind": ev.get("kind"),
@@ -1449,6 +1669,8 @@ async def handle_stream(request: web.Request) -> web.StreamResponse:
                         "created_at": created_at,
                         "content": ev.get("content", ""),
                         "tags": ev.get("tags", []),
+                        "reply_to": _reply_to,
+                        "parent_snippet": _parent_snippet,
                     }
                     # Emit SSE id line so EventSource can resume after
                     # disconnect by sending Last-Event-ID on reconnect.
@@ -1527,6 +1749,7 @@ def make_app(config: dict) -> web.Application:
     app.router.add_get("/v1/ui/focus", handle_focus_get)
     app.router.add_post("/v1/ui/focus", handle_focus_post)
     app.router.add_get("/v1/ui/stream", handle_stream)
+    app.router.add_get("/v1/ui/messages/{event_id}", handle_get_message)
     app.router.add_get("/v1/ui/memory/sources", handle_memory_list_sources)
     app.router.add_get("/v1/ui/memory/agents", handle_memory_list_agents)
     app.router.add_get("/v1/ui/memory/agents/{name}", handle_memory_get_agent)

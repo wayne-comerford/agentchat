@@ -160,10 +160,15 @@ async def test_post_signs_as_session_identity(aiohttp_client, tmp_keys, monkeypa
             captured["relays"] = relays
 
         def stop_listen(self): pass
-        def publish_channel_message(self, channel_id, content, mentions=None):
+        def publish_channel_message(
+            self, channel_id, content, mentions=None,
+            reply_to=None, parent_snippet=None, subject=None,
+        ):
             captured["channel"] = channel_id
             captured["content"] = content
             captured["mentions"] = mentions or []
+            captured["reply_to"] = reply_to
+            captured["parent_snippet"] = parent_snippet
             return "fake_event_id"
 
     monkeypatch.setattr(nb, "RelayPool", FakePool)
@@ -198,7 +203,10 @@ async def test_post_rejects_when_no_session(aiohttp_client, tmp_keys, monkeypatc
             captured["signed_with"] = keys.public_key_hex
 
         def stop_listen(self): pass
-        def publish_channel_message(self, channel_id, content, mentions=None):
+        def publish_channel_message(
+            self, channel_id, content, mentions=None,
+            reply_to=None, parent_snippet=None, subject=None,
+        ):
             captured["published"] = True
             return "fake_event_id"
 
@@ -228,7 +236,10 @@ async def test_post_rejects_when_invalid_session(aiohttp_client, tmp_keys, monke
             captured["signed_with"] = keys.public_key_hex
 
         def stop_listen(self): pass
-        def publish_channel_message(self, channel_id, content, mentions=None):
+        def publish_channel_message(
+            self, channel_id, content, mentions=None,
+            reply_to=None, parent_snippet=None, subject=None,
+        ):
             captured["published"] = True
             return "fake_event_id"
 
@@ -253,7 +264,10 @@ async def test_post_extracts_mentions_in_payload(aiohttp_client, tmp_keys, monke
     class FakePool:
         def __init__(self, relays, keys): pass
         def stop_listen(self): pass
-        def publish_channel_message(self, channel_id, content, mentions=None):
+        def publish_channel_message(
+            self, channel_id, content, mentions=None,
+            reply_to=None, parent_snippet=None, subject=None,
+        ):
             captured["mentions"] = mentions or []
             return "fake_event_id"
 

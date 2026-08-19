@@ -170,6 +170,9 @@ class RelayPool:
         content: str,
         *,
         mentions: Iterable[str] | None = None,
+        reply_to: str | None = None,
+        parent_snippet: str | None = None,
+        subject: str | None = None,
     ) -> str:
         """
         Build, sign, and publish a NIP-29 channel message (kind:9).
@@ -179,15 +182,44 @@ class RelayPool:
         websockets (NOT through pynostr's RelayManager). Reason: pynostr's
         Tornado IOLoop conflicts with aiohttp's asyncio loop, making publish
         silently fail. The raw path works in any async context.
+
+        Args:
+            channel_id: NIP-29 group id (#h tag value).
+            content:    message body.
+            mentions:   iterable of pubkey hex strings → #p tags.
+            reply_to:   optional event id (hex) of the message being replied
+                        to → adds a ["e", reply_to, "", "reply"] tag. Standard
+                        NIP-29 reply marker so any compliant client can
+                        thread the conversation.
+            parent_snippet: optional short text snippet of the parent
+                        message (max 140 chars) → adds a non-standard
+                        ["parent_snippet", text] tag. Lets UI render the
+                        quoted block without re-fetching the parent event
+                        (which may have scrolled off or be on another relay).
+                        Plain text only — strip markdown client-side first.
+            subject:    optional thread subject (NIP-29 first-post semantics).
         """
         if not self._endpoints:
             raise RuntimeError("RelayPool has no relay endpoints configured")
+        # Sanitise snippet — relay stores raw tag values, no markdown.
+        if parent_snippet is not None:
+            parent_snippet = parent_snippet.replace("\n", " ").strip()
+            if len(parent_snippet) > 140:
+                parent_snippet = parent_snippet[:137] + "..."
         ev = build_channel_message(
             keys=self._keys,
             group_id=channel_id,
             content=content,
             mentions=mentions,
+            reply_to=reply_to,
+            subject=subject,
         )
+        # Inject parent_snippet as a custom tag (after the standard ones
+        # build_channel_message produces). Tags are appended in order so
+        # downstream clients see: #h, #p (per mention), #e (reply), #subject
+        # (if any), then our custom #parent_snippet.
+        if parent_snippet:
+            ev.tags.append(["parent_snippet", parent_snippet])
         ev.sign(self._keys.private_key.hex())
         return _send_event_sync(ev, self._endpoints)
 
