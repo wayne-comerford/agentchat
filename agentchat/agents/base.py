@@ -370,6 +370,20 @@ class ReplyLoop:
         if not body:
             return
 
+        # Defence-in-depth sanitiser (dev29): reject replies that
+        # contain context-leak markers, silence sentinels, mangled
+        # @-mentions, bare handle words, or are over-length. Drop
+        # them silently — mark as seen so we don't keep retrying.
+        clean = sanitize_reply(body)
+        if clean is None:
+            log.info(
+                "[%s] reply rejected by sanitiser (eid=%s, body_len=%d)",
+                self.name, eid[:12], len(body) if isinstance(body, str) else 0,
+            )
+            self.dedupe.mark(eid)
+            return
+        body = clean
+
         channel = self._channel_of(ev)
         if not channel:
             return
