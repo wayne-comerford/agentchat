@@ -22,6 +22,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import signal
 import time
 from pathlib import Path
@@ -81,6 +82,98 @@ class ReplyDedupe:
         if len(self._seen) > 2000:
             self._seen = set(sorted(self._seen)[-2000:])
         self._save()
+
+
+# --------------------------------------------------------------------------- #
+# Reply sanitiser (defence-in-depth, dev29)
+# --------------------------------------------------------------------------- #
+
+# Markers that, if present in a reply, indicate the LLM leaked
+# surrounding context (telegram/agent/system markers, OOB wrappers,
+# other-agent names that shouldn't appear in this agent's voice).
+_LEAK_MARKERS = (
+    "[OUT-OF-BAND",
+    "[/OUT-OF-BAND]",
+    "OUT-OF-BAND USER MESSAGE",
+    "[empty reply",  # sentinel that should never be published
+)
+
+# Words/strings the LLM emits to signal "I have nothing to say"
+# — these must NEVER be published as reply content.
+_SILENCE_TOKENS = {
+    "(empty)", "empty", "silence", "(silence)", "no reply",
+    "(no reply)", "nothing", "—", "-", "...",
+}
+
+# A known internal handle appearing in content without its leading "@"
+# means the LLM is naming the wrong persona. The ReplyLoop will re-add
+# the proper #p tag server-side, so the reply body must not echo the
+# handle at all.
+_HANDLE_RE = re.compile(
+    r"(?<![A-Za-z0-9_@-])(wayne-observer|chappy|hermes)\b",
+    re.IGNORECASE,
+)
+
+# Sometimes the LLM emits a leading "-observer" or partial handle
+# because the `@` got eaten. Reject the whole reply in that case.
+_PARTIAL_HANDLE_RE = re.compile(
+    r"^\s*-?(observer|herms|hermes|chappy)\b",
+    re.IGNORECASE,
+)
+
+
+def sanitize_reply(text: object, max_chars: int = 500) -> str | None:
+    """
+    Defence-in-depth filter for LLM-generated reply bodies.
+
+    Returns the cleaned reply string, or None if the reply should be
+    dropped entirely (silence signal, context leak, oversize, or
+    mangled mention).
+
+    Applied AFTER any per-agent sanitiser (_sanitize_chappy_reply,
+    _sanitize_hermes_reply) strips internal @-mentions. This catches
+    everything else.
+    """
+    if not text or not isinstance(text, str):
+        return None
+    s = text.strip()
+    if not s:
+        return None
+
+    # Silence tokens
+    if s.lower() in _SILENCE_TOKENS:
+        return None
+
+    # Context-leak markers
+    lower = s.lower()
+    for marker in _LEAK_MARKERS:
+        if marker.lower() in lower:
+            return None
+
+    # Mangled @-mention: content starts with a partial handle like
+    # "-observer got it" or "observer got it".
+    if _PARTIAL_HANDLE_RE.match(s):
+        return None
+
+    # Any of our agent handles in the body without a leading "@" is
+    # a sign the LLM is naming the wrong persona. The ReplyLoop adds
+    # the proper #p tag server-side, so the body should not echo a
+    # bare handle. Allowed only if every match is preceded by "@".
+    if _HANDLE_RE.search(s):
+        stripped = re.sub(
+            r"@\s*(wayne-observer|chappy|hermes)\b",
+            "",
+            s,
+            flags=re.IGNORECASE,
+        )
+        if _HANDLE_RE.search(stripped):
+            return None
+
+    # Length cap
+    if len(s) > max_chars:
+        return None
+
+    return s
 
 
 # --------------------------------------------------------------------------- #
