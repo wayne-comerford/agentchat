@@ -101,6 +101,16 @@ async def call_llm(
         "--model", cfg.model,
         # No toolsets — replies are pure text, no tool use.
         "-t", "",
+        # Force-isolate: do NOT load AGENTS.md, SOUL.md, .cursorrules,
+        # the parent's user config.yaml, persistent memory, or
+        # state.db conversation history. The persona prompt is the
+        # ONLY context this LLM call should see. Without this, the
+        # subprocess loads 80k+ tokens of the parent Hermes session
+        # and the LLM echoes back the actual operating context
+        # (Telegram chat, etc.) instead of the in-character persona.
+        # Fix for dev29: prevent OOB/context-leak replies.
+        "--ignore-rules",
+        "--ignore-user-config",
     ]
 
     log.info("LLM call: model=%s prompt_chars=%d", cfg.model, len(prompt))
