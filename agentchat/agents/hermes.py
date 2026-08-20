@@ -77,8 +77,16 @@ class HermesLoop(ReplyLoop):
             return None
 
         # Build system prompt: base rules + persona voice.
+        # Context-disclaimer (dev29): the subprocess is invoked with
+        # --ignore-rules --ignore-user-config, but the prompt itself
+        # also disclaims prior context so the LLM doesn't try to
+        # reference "earlier messages" or system markers.
         system_prompt = (
-            self._base_prompt
+            "You are a fresh agent. You have NO prior context, no memory of "
+            "earlier conversations, no knowledge of the operator's other "
+            "chats, and no access to any system messages. The text below "
+            "is a single isolated message that requires one short reply.\n\n"
+            + self._base_prompt
             + "\n\n## Persona\n\n"
             + (persona_prompt(self._persona) or "(no persona prompt on disk)")
         )
